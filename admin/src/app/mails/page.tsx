@@ -1,17 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Badge, Text, useKumoToastManager } from "@cloudflare/kumo";
+import { Badge, Text } from "@cloudflare/kumo";
 import { AdminShell } from "@/components/admin-shell";
 import { DataTable, type Column } from "@/components/data-table";
 import { PageHeader } from "@/components/page-header";
 import { SearchBar } from "@/components/search-bar";
 import { api, formatDate, qs, type MailMeta } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { useStableToast } from "@/lib/toast";
 
 export default function MailsPage() {
   const { user } = useAuth();
-  const toast = useKumoToastManager();
+  const toast = useStableToast();
   const [q, setQ] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize] = useState(20);
@@ -25,13 +26,10 @@ export default function MailsPage() {
     try {
       const params = qs({ q, page, pageSize });
       const res = isAdmin ? await api.adminMails(params) : await api.mails(params);
-      setRows(res.items);
-      setTotal(res.total);
+      setRows(res.items ?? []);
+      setTotal(res.total ?? 0);
     } catch (e) {
-      toast.add({
-        title: "加载失败",
-        description: e instanceof Error ? e.message : "",
-      });
+      toast.error("加载失败", e instanceof Error ? e.message : "");
     } finally {
       setLoading(false);
     }
@@ -39,7 +37,7 @@ export default function MailsPage() {
 
   useEffect(() => {
     if (user) void load();
-  }, [user, load]);
+  }, [user?.id, user?.role, load]);
 
   const columns: Column<MailMeta>[] = [
     {
@@ -70,11 +68,7 @@ export default function MailsPage() {
           {
             key: "tenant",
             header: "租户",
-            cell: (r: MailMeta) => (
-              <Text variant="mono">
-                {r.tenant}
-              </Text>
-            ),
+            cell: (r: MailMeta) => <Text variant="mono">{r.tenant}</Text>,
           } as Column<MailMeta>,
         ]
       : []),

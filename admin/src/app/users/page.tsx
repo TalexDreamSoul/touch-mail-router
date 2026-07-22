@@ -9,7 +9,6 @@ import {
   Select,
   SensitiveInput,
   Text,
-  useKumoToastManager,
 } from "@cloudflare/kumo";
 import { PlusIcon, TrashIcon } from "@phosphor-icons/react";
 import { AdminShell } from "@/components/admin-shell";
@@ -18,12 +17,13 @@ import { PageHeader } from "@/components/page-header";
 import { SearchBar } from "@/components/search-bar";
 import { api, formatDate, qs, type User } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { useStableToast } from "@/lib/toast";
 import { useRouter } from "next/navigation";
 
 export default function UsersPage() {
   const { user } = useAuth();
   const router = useRouter();
-  const toast = useKumoToastManager();
+  const toast = useStableToast();
   const [q, setQ] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize] = useState(20);
@@ -43,13 +43,10 @@ export default function UsersPage() {
     setLoading(true);
     try {
       const res = await api.adminUsers(qs({ q, page, pageSize }));
-      setRows(res.items);
-      setTotal(res.total);
+      setRows(res.items ?? []);
+      setTotal(res.total ?? 0);
     } catch (e) {
-      toast.add({
-        title: "加载失败",
-        description: e instanceof Error ? e.message : "错误",
-      });
+      toast.error("加载失败", e instanceof Error ? e.message : "错误");
     } finally {
       setLoading(false);
     }
@@ -61,7 +58,7 @@ export default function UsersPage() {
       return;
     }
     if (user?.role === "admin") void load();
-  }, [user, load, router]);
+  }, [user?.id, user?.role, load, router]);
 
   const columns: Column<User>[] = [
     {
@@ -119,13 +116,10 @@ export default function UsersPage() {
                 await api.updateUser(r.id, {
                   status: r.status === "active" ? "disabled" : "active",
                 });
-                toast.add({ title: "已更新状态" });
+                toast.success("已更新状态");
                 void load();
               } catch (e) {
-                toast.add({
-                  title: "失败",
-                  description: e instanceof Error ? e.message : "",
-                });
+                toast.error("失败", e instanceof Error ? e.message : "");
               }
             }}
           >
@@ -139,13 +133,10 @@ export default function UsersPage() {
                 await api.updateUser(r.id, {
                   role: r.role === "admin" ? "user" : "admin",
                 });
-                toast.add({ title: "已更新角色" });
+                toast.success("已更新角色");
                 void load();
               } catch (e) {
-                toast.add({
-                  title: "失败",
-                  description: e instanceof Error ? e.message : "",
-                });
+                toast.error("失败", e instanceof Error ? e.message : "");
               }
             }}
           >
@@ -159,13 +150,10 @@ export default function UsersPage() {
               if (!confirm(`确认删除用户 ${r.username}？`)) return;
               try {
                 await api.deleteUser(r.id);
-                toast.add({ title: "已删除" });
+                toast.success("已删除");
                 void load();
               } catch (e) {
-                toast.add({
-                  title: "失败",
-                  description: e instanceof Error ? e.message : "",
-                });
+                toast.error("失败", e instanceof Error ? e.message : "");
               }
             }}
           >
@@ -227,7 +215,7 @@ export default function UsersPage() {
             <SensitiveInput
               label="密码"
               value={form.password}
-              onChange={(e) => setForm({ ...form, password: e.target.value })}
+              onValueChange={(v) => setForm({ ...form, password: v })}
             />
             <Select
               label="角色"
@@ -239,22 +227,25 @@ export default function UsersPage() {
               <Select.Option value="admin">管理员</Select.Option>
             </Select>
             <div className="mt-2 flex justify-end gap-2">
-              <Dialog.Close render={(p) => <Button {...p} variant="secondary">取消</Button>} />
+              <Dialog.Close
+                render={(p) => (
+                  <Button {...p} variant="secondary">
+                    取消
+                  </Button>
+                )}
+              />
               <Button
                 loading={saving}
                 onClick={async () => {
                   setSaving(true);
                   try {
                     await api.createUser(form);
-                    toast.add({ title: "用户已创建" });
+                    toast.success("用户已创建");
                     setCreateOpen(false);
                     setForm({ username: "", password: "", displayName: "", role: "user" });
                     void load();
                   } catch (e) {
-                    toast.add({
-                      title: "创建失败",
-                      description: e instanceof Error ? e.message : "",
-                    });
+                    toast.error("创建失败", e instanceof Error ? e.message : "");
                   } finally {
                     setSaving(false);
                   }

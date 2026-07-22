@@ -16,11 +16,48 @@ export interface User {
   updatedAt: string;
 }
 
+export type DomainVisibility = "public" | "private";
+
 export interface Domain {
   id: string;
   userId: string;
   domain: string;
   note: string;
+  /** public: listed on DuckMail /domains without key; private: needs owner's API key */
+  visibility: DomainVisibility;
+  createdAt: string;
+}
+
+/** API key permission scopes */
+export type ApiKeyScope = "read" | "write";
+
+/** Per-user DuckMail-style API key (dk_…) for private domain + AI-native access */
+export interface UserApiKey {
+  id: string;
+  userId: string;
+  /** full key, shown once on create; stored for verification */
+  key: string;
+  name: string;
+  /** read: list/query; write: create/mutate */
+  scopes: ApiKeyScope[];
+  status: "active" | "revoked";
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+/** Personal API call history (AI-native / DuckMail / personal keys) */
+export interface ApiCallLog {
+  id: string;
+  userId: string;
+  apiKeyId: string | null;
+  apiKeyName: string | null;
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+  ip?: string;
+  userAgent?: string;
+  error?: string;
   createdAt: string;
 }
 
@@ -73,18 +110,66 @@ export interface FeishuSettings {
   updatedBy: string | null;
 }
 
+/** DuckMail-compatible mailbox account (address + password + bearer tokens) */
+export interface MailAccount {
+  id: string;
+  address: string;
+  passwordHash: string;
+  /** inbound tenant key (local-part by default) */
+  tenant: string;
+  status: "active" | "disabled";
+  expiresAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MailToken {
+  token: string;
+  accountId: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface MessageFlags {
+  seen: boolean;
+  deleted: boolean;
+  updatedAt: string;
+}
+
 interface DbShape {
   users: User[];
   domains: Domain[];
   sessions: Session[];
   auditLogs: AuditLog[];
+  mailAccounts: MailAccount[];
+  mailTokens: MailToken[];
+  userApiKeys: UserApiKey[];
+  apiCallLogs: ApiCallLog[];
+  /** key: `${tenant}|${mailId}` */
+  messageFlags: Record<string, MessageFlags>;
   settings: {
     feishu: FeishuSettings;
+    /** Legacy / env-seeded global API keys (dk_…) — still accepted */
+    apiKeys: string[];
   };
 }
 
 function id(prefix = ""): string {
   return `${prefix}${randomBytes(12).toString("hex")}`;
+}
+
+function maskApiKey(key: string): string {
+  if (key.length <= 10) return "dk_••••";
+  return `${key.slice(0, 6)}…${key.slice(-4)}`;
+}
+
+function normalizeScopes(scopes: unknown): ApiKeyScope[] {
+  const set = new Set<ApiKeyScope>();
+  if (!Array.isArray(scopes)) return [];
+  for (const s of scopes) {
+    if (s === "read" || s === "write") set.add(s);
+  }
+  return [...set];
 }
 
 function slugify(input: string): string {
@@ -132,7 +217,12 @@ export class AppDb {
     domains: [],
     sessions: [],
     auditLogs: [],
-    settings: { feishu: defaultFeishu() },
+    mailAccounts: [],
+    mailTokens: [],
+    userApiKeys: [],
+    apiCallLogs: [],
+    messageFlags: {},
+    settings: { feishu: defaultFeishu(), apiKeys: [] },
   };
   private writeChain: Promise<void> = Promise.resolve();
 
@@ -147,14 +237,22 @@ export class AppDb {
     await mkdir(path.join(this.dataDir, "index"), { recursive: true });
     try {
       const raw = await readFile(this.file, "utf8");
-      const parsed = JSON.parse(raw) as Partial<DbShape>;
+      const parsed = JSON.parse(raw) as Partial<DbShape> & {
+        settings?: { feishu?: FeishuSettings; apiKeys?: string[] };
+      };
       this.data = {
         users: parsed.users || [],
         domains: parsed.domains || [],
         sessions: parsed.sessions || [],
         auditLogs: parsed.auditLogs || [],
+        mailAccounts: parsed.mailAccounts || [],
+        mailTokens: parsed.mailTokens || [],
+        userApiKeys: parsed.userApiKeys || [],
+        apiCallLogs: parsed.apiCallLogs || [],
+        messageFlags: parsed.messageFlags || {},
         settings: {
           feishu: { ...defaultFeishu(), ...(parsed.settings?.feishu || {}) },
+          apiKeys: parsed.settings?.apiKeys || [],
         },
       };
       // migrate legacy users without role/status
@@ -163,10 +261,33 @@ export class AppDb {
         if (!u.status) u.status = "active";
         if (!u.updatedAt) u.updatedAt = u.createdAt;
       }
+      // migrate domains: default private (safer) if visibility missing
+      let migrated = false;
+      for (const d of this.data.domains) {
+        if (d.visibility !== "public" && d.visibility !== "private") {
+          d.visibility = "private";
+          migrated = true;
+        }
+      }
+      // migrate API keys: scopes + status
+      for (const k of this.data.userApiKeys) {
+        if (!Array.isArray(k.scopes) || k.scopes.length === 0) {
+          k.scopes = ["read", "write"];
+          migrated = true;
+        } else {
+          k.scopes = k.scopes.filter((s): s is ApiKeyScope => s === "read" || s === "write");
+          if (k.scopes.length === 0) k.scopes = ["read"];
+        }
+        if (k.status !== "active" && k.status !== "revoked") {
+          k.status = "active";
+          migrated = true;
+        }
+      }
       // first user becomes admin if none
       if (this.data.users.length && !this.data.users.some((u) => u.role === "admin")) {
         this.data.users[0].role = "admin";
       }
+      if (migrated) await this.persist();
     } catch {
       await this.persist();
     }
@@ -466,7 +587,12 @@ export class AppDb {
     return { items: items.slice(start, start + pageSize), total, page, pageSize };
   }
 
-  async addDomain(userId: string, domainRaw: string, note = ""): Promise<Domain> {
+  async addDomain(
+    userId: string,
+    domainRaw: string,
+    note = "",
+    visibility: DomainVisibility = "private",
+  ): Promise<Domain> {
     const domain = domainRaw
       .trim()
       .toLowerCase()
@@ -478,15 +604,32 @@ export class AppDb {
     }
     const exists = this.data.domains.find((d) => d.userId === userId && d.domain === domain);
     if (exists) throw new Error("该域名已添加");
+    const vis: DomainVisibility = visibility === "public" ? "public" : "private";
 
     const item: Domain = {
       id: id("d"),
       userId,
       domain,
       note: note.slice(0, 200),
+      visibility: vis,
       createdAt: new Date().toISOString(),
     };
     this.data.domains.push(item);
+    await this.queueWrite();
+    return item;
+  }
+
+  async updateDomain(
+    userId: string,
+    domainId: string,
+    patch: Partial<{ note: string; visibility: DomainVisibility }>,
+  ): Promise<Domain | null> {
+    const item = this.data.domains.find((d) => d.userId === userId && d.id === domainId);
+    if (!item) return null;
+    if (patch.note !== undefined) item.note = String(patch.note).slice(0, 200);
+    if (patch.visibility === "public" || patch.visibility === "private") {
+      item.visibility = patch.visibility;
+    }
     await this.queueWrite();
     return item;
   }
@@ -787,5 +930,458 @@ export class AppDb {
       adminCount: this.data.users.filter((u) => u.role === "admin").length,
       activeUserCount: this.data.users.filter((u) => u.status === "active").length,
     };
+  }
+
+  // ---- DuckMail-compatible mailbox accounts ----
+
+  listPublicDomains(opts: {
+    systemDomain: string;
+    /** when set, also include this user's private domains */
+    apiKeyUserId?: string | null;
+    /** legacy: include all private domains (global key) */
+    includeAllPrivate?: boolean;
+  }): Array<{
+    id: string;
+    domain: string;
+    ownerId: string | null;
+    isVerified: boolean;
+    visibility: DomainVisibility;
+    verificationToken?: string;
+    createdAt: string;
+    updatedAt: string;
+  }> {
+    const system = opts.systemDomain.toLowerCase();
+    const out: Array<{
+      id: string;
+      domain: string;
+      ownerId: string | null;
+      isVerified: boolean;
+      visibility: DomainVisibility;
+      verificationToken?: string;
+      createdAt: string;
+      updatedAt: string;
+    }> = [
+      {
+        id: createHash("md5").update(`system|${system}`).digest("hex"),
+        domain: system,
+        ownerId: null,
+        isVerified: true,
+        visibility: "public",
+        createdAt: "0001-01-01T00:00:00Z",
+        updatedAt: "0001-01-01T00:00:00Z",
+      },
+    ];
+    for (const d of this.data.domains) {
+      const vis: DomainVisibility = d.visibility === "public" ? "public" : "private";
+      const allow =
+        vis === "public" ||
+        opts.includeAllPrivate ||
+        (opts.apiKeyUserId && d.userId === opts.apiKeyUserId);
+      if (!allow) continue;
+      out.push({
+        id: d.id,
+        domain: d.domain,
+        ownerId: d.userId,
+        isVerified: true,
+        visibility: vis,
+        verificationToken: `touchmail-verify-${d.id.slice(0, 12)}`,
+        createdAt: d.createdAt,
+        updatedAt: d.createdAt,
+      });
+    }
+    // de-dupe by domain
+    const seen = new Set<string>();
+    return out.filter((d) => {
+      if (seen.has(d.domain)) return false;
+      seen.add(d.domain);
+      return true;
+    });
+  }
+
+  findMailAccountByAddress(address: string): MailAccount | undefined {
+    return this.data.mailAccounts.find((a) => a.address === address.toLowerCase());
+  }
+
+  findMailAccountById(id: string): MailAccount | undefined {
+    return this.data.mailAccounts.find((a) => a.id === id);
+  }
+
+  findMailAccountByTenant(tenant: string): MailAccount | undefined {
+    return this.data.mailAccounts.find((a) => a.tenant === tenant.toLowerCase());
+  }
+
+  async createMailAccount(opts: {
+    address: string;
+    password: string;
+    expiresAt: string | null;
+    tenant: string;
+  }): Promise<MailAccount> {
+    const address = opts.address.toLowerCase().trim();
+    if (this.findMailAccountByAddress(address)) {
+      throw new Error("email address already exists");
+    }
+    let tenant = slugify(opts.tenant) || id("t").slice(0, 10);
+    // ensure tenant unique among users + mail accounts
+    if (this.findUserByTenant(tenant) || this.findMailAccountByTenant(tenant)) {
+      tenant = `${tenant}-${randomBytes(2).toString("hex")}`;
+    }
+    const now = new Date().toISOString();
+    const account: MailAccount = {
+      id: id("ma").replace(/^ma/, "") || randomBytes(16).toString("hex"),
+      address,
+      passwordHash: hashPassword(opts.password),
+      tenant,
+      status: "active",
+      expiresAt: opts.expiresAt,
+      createdAt: now,
+      updatedAt: now,
+    };
+    // prefer pure hex-ish ids like duckmail
+    account.id = randomBytes(16).toString("hex");
+    this.data.mailAccounts.push(account);
+    await this.queueWrite();
+    return account;
+  }
+
+  async deleteMailAccount(accountId: string): Promise<boolean> {
+    const before = this.data.mailAccounts.length;
+    this.data.mailAccounts = this.data.mailAccounts.filter((a) => a.id !== accountId);
+    this.data.mailTokens = this.data.mailTokens.filter((t) => t.accountId !== accountId);
+    if (this.data.mailAccounts.length === before) return false;
+    await this.queueWrite();
+    return true;
+  }
+
+  async createMailToken(accountId: string, days = 365): Promise<string> {
+    // opaque token (not JWT) — still works as Bearer for clients
+    const token = `tm_${randomBytes(32).toString("base64url")}`;
+    const entry: MailToken = {
+      token,
+      accountId,
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + days * 86400_000).toISOString(),
+    };
+    this.data.mailTokens.push(entry);
+    // prune expired
+    const now = Date.now();
+    this.data.mailTokens = this.data.mailTokens.filter((t) => Date.parse(t.expiresAt) > now);
+    // limit tokens per account
+    const mine = this.data.mailTokens.filter((t) => t.accountId === accountId);
+    if (mine.length > 20) {
+      const drop = mine
+        .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+        .slice(0, mine.length - 20)
+        .map((t) => t.token);
+      this.data.mailTokens = this.data.mailTokens.filter((t) => !drop.includes(t.token));
+    }
+    await this.queueWrite();
+    return token;
+  }
+
+  getMailAccountByToken(token: string): MailAccount | undefined {
+    const now = Date.now();
+    const t = this.data.mailTokens.find(
+      (x) => x.token === token && Date.parse(x.expiresAt) > now,
+    );
+    if (!t) return undefined;
+    return this.findMailAccountById(t.accountId);
+  }
+
+  /**
+   * Resolve DuckMail / AI-native API key.
+   * - user keys (userApiKeys): scoped to that user + scopes
+   * - global settings.apiKeys (env seed): full access, all private domains
+   */
+  resolveApiKey(key: string): {
+    ok: boolean;
+    userId: string | null;
+    global: boolean;
+    keyId: string | null;
+    keyName: string | null;
+    scopes: ApiKeyScope[];
+  } {
+    if (!key || !key.startsWith("dk_")) {
+      return {
+        ok: false,
+        userId: null,
+        global: false,
+        keyId: null,
+        keyName: null,
+        scopes: [],
+      };
+    }
+    const userKey = this.data.userApiKeys.find(
+      (k) => k.key === key && k.status !== "revoked",
+    );
+    if (userKey) {
+      userKey.lastUsedAt = new Date().toISOString();
+      void this.queueWrite();
+      const scopes =
+        Array.isArray(userKey.scopes) && userKey.scopes.length
+          ? userKey.scopes
+          : (["read", "write"] as ApiKeyScope[]);
+      return {
+        ok: true,
+        userId: userKey.userId,
+        global: false,
+        keyId: userKey.id,
+        keyName: userKey.name,
+        scopes,
+      };
+    }
+    if (this.data.settings.apiKeys.includes(key)) {
+      return {
+        ok: true,
+        userId: null,
+        global: true,
+        keyId: null,
+        keyName: "global",
+        scopes: ["read", "write"],
+      };
+    }
+    return {
+      ok: false,
+      userId: null,
+      global: false,
+      keyId: null,
+      keyName: null,
+      scopes: [],
+    };
+  }
+
+  verifyApiKey(key: string): boolean {
+    return this.resolveApiKey(key).ok;
+  }
+
+  listApiKeys(): string[] {
+    return [...this.data.settings.apiKeys];
+  }
+
+  async addApiKey(key?: string): Promise<string> {
+    const k = key || `dk_${randomBytes(24).toString("hex")}`;
+    if (!k.startsWith("dk_")) throw new Error("API key must start with dk_");
+    if (!this.data.settings.apiKeys.includes(k)) {
+      this.data.settings.apiKeys.push(k);
+      await this.queueWrite();
+    }
+    return k;
+  }
+
+  async removeApiKey(key: string): Promise<boolean> {
+    const before = this.data.settings.apiKeys.length;
+    this.data.settings.apiKeys = this.data.settings.apiKeys.filter((k) => k !== key);
+    if (this.data.settings.apiKeys.length === before) return false;
+    await this.queueWrite();
+    return true;
+  }
+
+  // ---- per-user API keys ----
+
+  listUserApiKeys(userId: string): Array<{
+    id: string;
+    name: string;
+    scopes: ApiKeyScope[];
+    status: "active" | "revoked";
+    /** masked key for list UI */
+    keyPreview: string;
+    createdAt: string;
+    lastUsedAt: string | null;
+  }> {
+    return this.data.userApiKeys
+      .filter((k) => k.userId === userId)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .map((k) => ({
+        id: k.id,
+        name: k.name,
+        scopes: k.scopes?.length ? k.scopes : (["read", "write"] as ApiKeyScope[]),
+        status: k.status === "revoked" ? "revoked" : "active",
+        keyPreview: maskApiKey(k.key),
+        createdAt: k.createdAt,
+        lastUsedAt: k.lastUsedAt,
+      }));
+  }
+
+  async createUserApiKey(
+    userId: string,
+    name = "",
+    scopes: ApiKeyScope[] = ["read", "write"],
+  ): Promise<{
+    id: string;
+    name: string;
+    key: string;
+    scopes: ApiKeyScope[];
+    status: "active";
+    createdAt: string;
+  }> {
+    const mine = this.data.userApiKeys.filter((k) => k.userId === userId);
+    if (mine.length >= 20) throw new Error("每个用户最多 20 个 API Key");
+    const cleanScopes = normalizeScopes(scopes);
+    if (!cleanScopes.length) throw new Error("至少选择一个权限：read 或 write");
+    const key = `dk_${randomBytes(24).toString("hex")}`;
+    const item: UserApiKey = {
+      id: id("ak"),
+      userId,
+      key,
+      name: (name || "default").slice(0, 64),
+      scopes: cleanScopes,
+      status: "active",
+      createdAt: new Date().toISOString(),
+      lastUsedAt: null,
+    };
+    this.data.userApiKeys.push(item);
+    await this.queueWrite();
+    return {
+      id: item.id,
+      name: item.name,
+      key: item.key,
+      scopes: item.scopes,
+      status: "active",
+      createdAt: item.createdAt,
+    };
+  }
+
+  async updateUserApiKey(
+    userId: string,
+    keyId: string,
+    patch: Partial<{ name: string; scopes: ApiKeyScope[]; status: "active" | "revoked" }>,
+  ): Promise<UserApiKey | null> {
+    const item = this.data.userApiKeys.find((k) => k.userId === userId && k.id === keyId);
+    if (!item) return null;
+    if (patch.name !== undefined) item.name = String(patch.name).slice(0, 64);
+    if (patch.scopes) {
+      const s = normalizeScopes(patch.scopes);
+      if (!s.length) throw new Error("至少选择一个权限：read 或 write");
+      item.scopes = s;
+    }
+    if (patch.status === "active" || patch.status === "revoked") item.status = patch.status;
+    await this.queueWrite();
+    return item;
+  }
+
+  async deleteUserApiKey(userId: string, keyId: string): Promise<boolean> {
+    const before = this.data.userApiKeys.length;
+    this.data.userApiKeys = this.data.userApiKeys.filter(
+      (k) => !(k.userId === userId && k.id === keyId),
+    );
+    if (this.data.userApiKeys.length === before) return false;
+    await this.queueWrite();
+    return true;
+  }
+
+  // ---- API call history ----
+
+  async addApiCallLog(entry: {
+    userId: string;
+    apiKeyId?: string | null;
+    apiKeyName?: string | null;
+    method: string;
+    path: string;
+    status: number;
+    durationMs: number;
+    ip?: string;
+    userAgent?: string;
+    error?: string;
+  }): Promise<ApiCallLog> {
+    const log: ApiCallLog = {
+      id: id("cl"),
+      userId: entry.userId,
+      apiKeyId: entry.apiKeyId ?? null,
+      apiKeyName: entry.apiKeyName ?? null,
+      method: entry.method.toUpperCase(),
+      path: entry.path.slice(0, 500),
+      status: entry.status,
+      durationMs: Math.max(0, Math.round(entry.durationMs)),
+      ip: entry.ip,
+      userAgent: entry.userAgent?.slice(0, 300),
+      error: entry.error?.slice(0, 500),
+      createdAt: new Date().toISOString(),
+    };
+    this.data.apiCallLogs.unshift(log);
+    // keep last 5000 per installation
+    if (this.data.apiCallLogs.length > 5000) {
+      this.data.apiCallLogs = this.data.apiCallLogs.slice(0, 5000);
+    }
+    await this.queueWrite();
+    return log;
+  }
+
+  listApiCallLogs(
+    userId: string,
+    opts: { q?: string; page?: number; pageSize?: number } = {},
+  ): {
+    items: ApiCallLog[];
+    total: number;
+    page: number;
+    pageSize: number;
+  } {
+    const page = Math.max(1, opts.page || 1);
+    const pageSize = Math.min(100, Math.max(1, opts.pageSize || 20));
+    let items = this.data.apiCallLogs.filter((l) => l.userId === userId);
+    if (opts.q) {
+      const q = opts.q.toLowerCase();
+      items = items.filter(
+        (l) =>
+          l.path.toLowerCase().includes(q) ||
+          l.method.toLowerCase().includes(q) ||
+          (l.apiKeyName || "").toLowerCase().includes(q) ||
+          String(l.status).includes(q),
+      );
+    }
+    const total = items.length;
+    const start = (page - 1) * pageSize;
+    return { items: items.slice(start, start + pageSize), total, page, pageSize };
+  }
+
+  private flagKey(tenant: string, mailId: string): string {
+    return `${tenant}|${mailId}`;
+  }
+
+  getMessageFlags(tenant: string, mailId: string): MessageFlags {
+    return (
+      this.data.messageFlags[this.flagKey(tenant, mailId)] || {
+        seen: false,
+        deleted: false,
+        updatedAt: new Date(0).toISOString(),
+      }
+    );
+  }
+
+  async setMessageFlags(
+    tenant: string,
+    mailId: string,
+    patch: Partial<Pick<MessageFlags, "seen" | "deleted">>,
+  ): Promise<MessageFlags> {
+    const key = this.flagKey(tenant, mailId);
+    const cur = this.getMessageFlags(tenant, mailId);
+    const next: MessageFlags = {
+      seen: patch.seen ?? cur.seen,
+      deleted: patch.deleted ?? cur.deleted,
+      updatedAt: new Date().toISOString(),
+    };
+    this.data.messageFlags[key] = next;
+    await this.queueWrite();
+    return next;
+  }
+
+  async listMailsForAccount(
+    account: MailAccount,
+    opts: { page?: number; pageSize?: number; includeDeleted?: boolean } = {},
+  ): Promise<{ items: MailMeta[]; total: number; page: number; pageSize: number }> {
+    const page = Math.max(1, opts.page || 1);
+    const pageSize = Math.min(100, Math.max(1, opts.pageSize || 30));
+    // list by tenant storage
+    const all = await this.listMails(account.tenant, { page: 1, pageSize: 10000 });
+    let items = all.items;
+    if (!opts.includeDeleted) {
+      items = items.filter((m) => !this.getMessageFlags(account.tenant, m.id).deleted);
+    }
+    const total = items.length;
+    const start = (page - 1) * pageSize;
+    return { items: items.slice(start, start + pageSize), total, page, pageSize };
+  }
+
+  /** Whether inbound tenant is allowed (SaaS user OR DuckMail mailbox) */
+  isKnownTenant(tenant: string): boolean {
+    return Boolean(this.findUserByTenant(tenant) || this.findMailAccountByTenant(tenant));
   }
 }

@@ -12,6 +12,8 @@ const schema = z.object({
   PUBLIC_URL: z.string().default("http://127.0.0.1:8788"),
   INBOUND_DOMAIN: z.string().default("inbound.example.com"),
   APP_NAME: z.string().default("Touch Mail"),
+  /** Comma-separated DuckMail-style API keys (dk_xxx) for private domains */
+  API_KEYS: z.string().optional().default(""),
   COOKIE_SECURE: z
     .string()
     .optional()

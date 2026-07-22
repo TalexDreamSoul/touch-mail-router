@@ -1,13 +1,19 @@
 "use client";
 
-import { Empty, LayerCard, Loader, Pagination, Table, Text } from "@cloudflare/kumo";
+import {
+  Empty,
+  LayerCard,
+  Loader,
+  Pagination,
+  Table,
+  Text,
+} from "@cloudflare/kumo";
 import type { ReactNode } from "react";
 
 export type Column<T> = {
   key: string;
   header: string;
   cell: (row: T) => ReactNode;
-  className?: string;
 };
 
 export function DataTable<T extends { id: string }>({
@@ -31,52 +37,55 @@ export function DataTable<T extends { id: string }>({
   total: number;
   onPageChange: (page: number) => void;
 }) {
+  const safeRows = rows ?? [];
+  const safeTotal = Number.isFinite(total) ? total : 0;
+  const safePage = Math.max(1, page || 1);
+  const safePerPage = Math.max(1, pageSize || 20);
+
   return (
-    <LayerCard className="overflow-hidden p-0">
-      {loading ? (
-        <div className="flex items-center justify-center gap-2 p-12">
-          <Loader />
-          <Text variant="secondary">加载中…</Text>
-        </div>
-      ) : rows.length === 0 ? (
-        <div className="p-8">
-          <Empty title={emptyTitle} description={emptyDescription} />
-        </div>
-      ) : (
-        <div className="overflow-x-auto">
+    <LayerCard>
+      <LayerCard.Primary>
+        {loading ? (
+          <div className="flex items-center justify-center gap-2 py-12">
+            <Loader />
+            <Text variant="secondary">加载中…</Text>
+          </div>
+        ) : safeRows.length === 0 ? (
+          <Empty
+            size="sm"
+            title={emptyTitle}
+            description={emptyDescription || "没有可显示的记录"}
+          />
+        ) : (
           <Table>
             <Table.Header>
               <Table.Row>
                 {columns.map((col) => (
-                  <Table.Head key={col.key} className={col.className}>
-                    {col.header}
-                  </Table.Head>
+                  <Table.Head key={col.key}>{col.header}</Table.Head>
                 ))}
               </Table.Row>
             </Table.Header>
             <Table.Body>
-              {rows.map((row) => (
+              {safeRows.map((row) => (
                 <Table.Row key={row.id}>
                   {columns.map((col) => (
-                    <Table.Cell key={col.key} className={col.className}>
-                      {col.cell(row)}
-                    </Table.Cell>
+                    <Table.Cell key={col.key}>{col.cell(row)}</Table.Cell>
                   ))}
                 </Table.Row>
               ))}
             </Table.Body>
           </Table>
-        </div>
-      )}
-      <div className="border-t border-kumo-hairline px-4 py-3">
+        )}
+      </LayerCard.Primary>
+      <LayerCard.Secondary>
         <Pagination
-          page={page}
+          page={safePage}
           setPage={onPageChange}
-          perPage={pageSize}
-          totalCount={total}
+          perPage={safePerPage}
+          totalCount={safeTotal}
           controls="full"
         />
-      </div>
+      </LayerCard.Secondary>
     </LayerCard>
   );
 }

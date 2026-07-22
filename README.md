@@ -127,7 +127,47 @@ curl -s http://127.0.0.1:8788/health
 
 ## 3. 主要 API
 
-### 公共 / 租户
+### DuckMail 兼容 API（对外主接口）
+
+对齐 [DuckMail API](https://www.duckmail.sbs/zh/api-docs) / [llm-api-docs](https://raw.githubusercontent.com/MoonWeSif/DuckMail/main/public/llm-api-docs.txt)，可直接替换 `https://api.duckmail.sbs` 为你的 `PUBLIC_URL`。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/domains` | 可用域名列表（Hydra）；`Authorization: Bearer dk_xxx` 时含私有域名 |
+| `POST` | `/accounts` | 创建邮箱账户 `{ address, password, expiresIn? }` |
+| `POST` | `/token` | 用 address+password 换 Bearer Token |
+| `GET` | `/me` | 当前账户信息 |
+| `DELETE` | `/accounts/{id}` | 删除当前登录账户 |
+| `GET` | `/messages` | 收件箱列表（`page`，每页 30，Hydra） |
+| `GET` | `/messages/{id}` | 邮件详情（含 text/html/attachments） |
+| `PATCH` | `/messages/{id}` | 标记已读 → `{ seen: true }` |
+| `DELETE` | `/messages/{id}` | 删除邮件 → `204` |
+| `GET` | `/sources/{id}` | 原始 RFC822 |
+
+认证：`Authorization: Bearer <token>`；私有域名可选 `dk_` 开头 API Key（环境变量 `API_KEYS`）。
+
+错误格式：`{ "error": "Conflict", "message": "..." }`，状态码含 400/401/403/404/409/422。
+
+也可挂在前缀 `/dm/*`（如 `/dm/messages`），便于与后台同域分流。
+
+快速示例：
+
+```bash
+# 1. 创建账户
+curl -X POST "$PUBLIC_URL/accounts" -H 'Content-Type: application/json' \
+  -d '{"address":"test@inbound.example.com","password":"mypassword","expiresIn":0}'
+
+# 2. 取 Token
+curl -X POST "$PUBLIC_URL/token" -H 'Content-Type: application/json' \
+  -d '{"address":"test@inbound.example.com","password":"mypassword"}'
+
+# 3. 读邮件
+curl "$PUBLIC_URL/messages" -H "Authorization: Bearer <token>"
+```
+
+创建账户时 `address` 的 local-part 会作为入站 `tenant`，Worker 推送到 `{local}@INBOUND_DOMAIN` 即可进该邮箱。
+
+### 管理后台 API（内部）
 
 | 方法 | 路径 | 说明 |
 |------|------|------|

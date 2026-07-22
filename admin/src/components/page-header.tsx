@@ -1,7 +1,8 @@
 "use client";
 
-import { Text } from "@cloudflare/kumo";
+import { Breadcrumbs } from "@cloudflare/kumo";
 import type { ReactNode } from "react";
+import { PageHeader as KumoPageHeader } from "@/components/kumo/page-header";
 
 export function PageHeader({
   title,
@@ -13,18 +14,18 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div>
-        <Text variant="heading1" as="h1">
-          {title}
-        </Text>
-        {description ? (
-          <Text variant="secondary">
-            {description}
-          </Text>
-        ) : null}
-      </div>
-      {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
-    </div>
+    <KumoPageHeader
+      breadcrumbs={
+        <Breadcrumbs>
+          <Breadcrumbs.Link href="/dashboard">Touch Mail</Breadcrumbs.Link>
+          <Breadcrumbs.Separator />
+          <Breadcrumbs.Current>{title}</Breadcrumbs.Current>
+        </Breadcrumbs>
+      }
+      title={title}
+      description={description}
+    >
+      {actions}
+    </KumoPageHeader>
   );
 }

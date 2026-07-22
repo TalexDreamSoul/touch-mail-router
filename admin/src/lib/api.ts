@@ -10,14 +10,64 @@ export type User = {
   inboundAddress: string;
 };
 
+export type DomainVisibility = "public" | "private";
+
 export type Domain = {
   id: string;
   userId: string;
   domain: string;
   note: string;
+  visibility: DomainVisibility;
   createdAt: string;
   username?: string;
   tenant?: string;
+};
+
+export type ApiKeyScope = "read" | "write";
+
+export type UserApiKey = {
+  id: string;
+  name: string;
+  scopes: ApiKeyScope[];
+  status: "active" | "revoked";
+  keyPreview: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+};
+
+export type CreatedUserApiKey = {
+  id: string;
+  name: string;
+  key: string;
+  scopes: ApiKeyScope[];
+  status: "active";
+  createdAt: string;
+};
+
+export type ApiCallLog = {
+  id: string;
+  userId: string;
+  apiKeyId: string | null;
+  apiKeyName: string | null;
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+  ip?: string;
+  userAgent?: string;
+  error?: string;
+  createdAt: string;
+};
+
+export type ApiDocsInfo = {
+  openapiUrl: string;
+  skillUrl: string;
+  docsUrl: string;
+  baseUrl: string;
+  auth: string;
+  scopes: Record<string, string>;
+  endpoints: Record<string, string>;
+  duckmail: Record<string, string>;
 };
 
 export type MailMeta = {
@@ -70,15 +120,36 @@ export type PageResult<T> = {
   pageSize: number;
 };
 
+export type WorkerSnippet = {
+  tenant: string;
+  inboundAddress: string;
+  webhookUrl: string;
+  js: string;
+  wranglerToml: string;
+  setupSteps: string[];
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      ...init,
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(init?.headers || {}),
+      },
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Browsers surface network/CORS/proxy failures as "Failed to fetch"
+    if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+      throw new Error(
+        "无法连接 API（检查 admin 代理与 server 是否在运行：默认 http://127.0.0.1:8789）",
+      );
+    }
+    throw err instanceof Error ? err : new Error(msg);
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error((data as { error?: string }).error || `请求失败 ${res.status}`);
@@ -104,16 +175,48 @@ export const api = {
   dashboard: () => request<Record<string, unknown>>("/api/dashboard"),
   domains: (params: URLSearchParams) =>
     request<PageResult<Domain>>(`/api/domains?${params}`),
-  createDomain: (domain: string, note?: string) =>
+  createDomain: (
+    domain: string,
+    note?: string,
+    visibility: DomainVisibility = "private",
+  ) =>
     request<{ ok: boolean; domain: Domain }>("/api/domains", {
       method: "POST",
-      body: JSON.stringify({ domain, note }),
+      body: JSON.stringify({ domain, note, visibility }),
+    }),
+  updateDomain: (
+    id: string,
+    body: Partial<{ note: string; visibility: DomainVisibility }>,
+  ) =>
+    request<{ ok: boolean; domain: Domain }>(`/api/domains/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
     }),
   deleteDomain: (id: string) =>
     request<{ ok: boolean }>(`/api/domains/${id}`, { method: "DELETE" }),
   mails: (params: URLSearchParams) =>
     request<PageResult<MailMeta>>(`/api/mails?${params}`),
-  workerSnippet: () => request<Record<string, unknown>>("/api/worker-snippet"),
+  workerSnippet: () => request<WorkerSnippet>("/api/worker-snippet"),
+
+  listApiKeys: () => request<{ items: UserApiKey[] }>("/api/me/api-keys"),
+  createApiKey: (name?: string, scopes: ApiKeyScope[] = ["read", "write"]) =>
+    request<{ ok: boolean; key: CreatedUserApiKey }>("/api/me/api-keys", {
+      method: "POST",
+      body: JSON.stringify({ name, scopes }),
+    }),
+  updateApiKey: (
+    id: string,
+    body: Partial<{ name: string; scopes: ApiKeyScope[]; status: "active" | "revoked" }>,
+  ) =>
+    request<{ ok: boolean; key: UserApiKey }>(`/api/me/api-keys/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteApiKey: (id: string) =>
+    request<{ ok: boolean }>(`/api/me/api-keys/${id}`, { method: "DELETE" }),
+  apiHistory: (params: URLSearchParams) =>
+    request<PageResult<ApiCallLog>>(`/api/me/api-history?${params}`),
+  apiDocs: () => request<ApiDocsInfo>("/api/me/api-docs"),
 
   adminOverview: () => request<Record<string, unknown>>("/api/admin/overview"),
   adminUsers: (params: URLSearchParams) =>

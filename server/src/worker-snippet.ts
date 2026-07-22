@@ -153,10 +153,12 @@ ALLOWED_TENANTS = ${JSON.stringify(tenant)}
 `;
 
   const setupSteps = [
-    `在 Cloudflare 控制台创建 Worker，粘贴 Worker 代码并部署。`,
-    `Email Routing 绑定域名 ${inboundDomain}（或你的入站域），Catch-all 指向该 Worker。`,
-    `把业务邮箱转发到 ${tenant}@${inboundDomain}（或 ${tenant}+orders@${inboundDomain}）。`,
-    `也可在本平台「域名」页登记你的客户域，仅作台账与说明，转发目标仍是上述入站地址。`,
+    `在 Cloudflare 控制台创建 Worker，粘贴下方 Worker 代码（或用 wrangler.toml 部署）并发布。`,
+    `为入站域 ${inboundDomain} 开启 Email Routing，Catch-all / 路由规则指向该 Worker（不是客户业务域的 MX）。`,
+    `配置 Secret：WEBHOOK_SECRET（与本服务一致）；变量 WEBHOOK_URL / INBOUND_DOMAINS / ALLOWED_TENANTS 见代码或 wrangler.toml。`,
+    `把客户业务邮箱完整转发到 ${tenant}@${inboundDomain}（渠道：${tenant}+orders@${inboundDomain}）。`,
+    `在本平台「域名」页登记客户域仅为台账；收信依赖转发 + Worker，登记本身不会接通邮件。`,
+    `发一封测试信后到「邮件」页确认入站；本地可用 scripts/simulate-inbound.sh 模拟推送。`,
   ];
 
   return { js, wranglerToml, setupSteps };

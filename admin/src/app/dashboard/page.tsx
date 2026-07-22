@@ -62,51 +62,53 @@ export default function DashboardPage() {
       ) : null}
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <LayerCard className="p-5">
-          <Text variant="heading3" as="h2">
-            入站地址
-          </Text>
-          {data?.inboundAddress ? (
-            <div>
+        <LayerCard>
+          <LayerCard.Secondary>入站地址</LayerCard.Secondary>
+          <LayerCard.Primary>
+            <div className="flex flex-col gap-3">
+              {data?.inboundAddress ? (
+                <ClipboardText
+                  text={data.inboundAddress}
+                  size="base"
+                  tooltip={{ text: "复制", copiedText: "已复制" }}
+                  labels={{ copyAction: "复制入站地址" }}
+                />
+              ) : (
+                <Text variant="secondary">加载中…</Text>
+              )}
               <Text variant="secondary" size="sm">
-                转发到此地址
+                客户把邮箱完整转发到该地址，即可经 Cloudflare Worker 入站。
               </Text>
-              <ClipboardText text={data.inboundAddress} size="base" />
             </div>
-          ) : (
-            <Text variant="secondary">加载中…</Text>
-          )}
-          <Text variant="secondary" size="sm">
-            客户把邮箱完整转发到该地址，即可经 Cloudflare Worker 入站。
-          </Text>
+          </LayerCard.Primary>
         </LayerCard>
 
-        <LayerCard className="p-5">
-          <Text variant="heading3" as="h2">
-            最近邮件
-          </Text>
-          <div className="flex flex-col gap-3">
-            {(data?.recentMails || []).length === 0 ? (
-              <Text variant="secondary">暂无邮件</Text>
-            ) : (
-              (data?.recentMails || []).map((m) => (
-                <div
-                  key={m.id}
-                  className="flex flex-col gap-1 border-b border-kumo-hairline pb-3 last:border-0"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <Text size="sm" truncate>
-                      {m.subject || "(无主题)"}
+        <LayerCard>
+          <LayerCard.Secondary>最近邮件</LayerCard.Secondary>
+          <LayerCard.Primary>
+            <div className="flex flex-col gap-3">
+              {(data?.recentMails || []).length === 0 ? (
+                <Text variant="secondary">暂无邮件</Text>
+              ) : (
+                (data?.recentMails || []).map((m) => (
+                  <div
+                    key={m.id}
+                    className="flex flex-col gap-1 border-b border-kumo-hairline pb-3 last:border-0 last:pb-0"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <Text size="sm" truncate>
+                        {m.subject || "(无主题)"}
+                      </Text>
+                      {m.hasAttachments ? <Badge variant="outline">附件</Badge> : null}
+                    </div>
+                    <Text variant="secondary" size="xs">
+                      {m.from} · {formatDate(m.receivedAt)}
                     </Text>
-                    {m.hasAttachments ? <Badge variant="outline">附件</Badge> : null}
                   </div>
-                  <Text variant="secondary" size="xs">
-                    {m.from} · {formatDate(m.receivedAt)}
-                  </Text>
-                </div>
-              ))
-            )}
-          </div>
+                ))
+              )}
+            </div>
+          </LayerCard.Primary>
         </LayerCard>
       </div>
     </AdminShell>
@@ -115,13 +117,13 @@ export default function DashboardPage() {
 
 function StatCard({ label, value }: { label: string; value: string }) {
   return (
-    <LayerCard className="p-4">
-      <Text variant="secondary" size="sm">
-        {label}
-      </Text>
-      <Text variant="heading2" as="h2" truncate>
-        {value}
-      </Text>
+    <LayerCard>
+      <LayerCard.Secondary>{label}</LayerCard.Secondary>
+      <LayerCard.Primary>
+        <Text variant="heading2" as="h2" truncate>
+          {value}
+        </Text>
+      </LayerCard.Primary>
     </LayerCard>
   );
 }

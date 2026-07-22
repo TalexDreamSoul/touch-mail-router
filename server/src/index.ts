@@ -9,7 +9,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.js";
 import { verifySignature } from "./crypto.js";
-import { AppDb, verifyPassword, type User, type UserRole } from "./db.js";
+import { AppDb, verifyPassword, type ApiKeyScope, type User, type UserRole } from "./db.js";
+import { createAiNativeApp } from "./ai-native.js";
+import { createDuckMailApp } from "./duckmail.js";
 import { parseRawEmail } from "./parse.js";
 import { buildWorkerSnippet } from "./worker-snippet.js";
 
@@ -19,6 +21,17 @@ const publicDir = path.join(__dirname, "..", "public");
 const config = loadConfig();
 const db = new AppDb(config.DATA_DIR);
 await db.init();
+
+// seed API keys from env (dk_xxx,...)
+if (config.API_KEYS) {
+  for (const k of config.API_KEYS.split(",").map((s) => s.trim()).filter(Boolean)) {
+    try {
+      await db.addApiKey(k);
+    } catch {
+      /* ignore invalid */
+    }
+  }
+}
 
 type Vars = { user: User };
 
@@ -35,6 +48,48 @@ app.use(
     allowHeaders: ["Content-Type", "Authorization"],
   }),
 );
+
+// AI-native + DuckMail public APIs also need CORS for agent tools
+app.use(
+  "/ai/*",
+  cors({
+    origin: (origin) => origin || "*",
+    credentials: true,
+    allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+  }),
+);
+
+// AI-native agent API (/ai/v1/*)
+const aiApp = createAiNativeApp(db, config);
+app.route("/", aiApp);
+
+// DuckMail-compatible public API (paths match api.duckmail.sbs)
+// Only intercept DuckMail paths so the legacy SPA can still serve other routes.
+const duck = createDuckMailApp(db, config);
+const duckPrefixes = [
+  "/domains",
+  "/accounts",
+  "/token",
+  "/me",
+  "/messages",
+  "/sources",
+  "/dm",
+];
+app.use("*", async (c, next) => {
+  const p = c.req.path;
+  // let AI-native handle its own paths (already routed)
+  if (p === "/ai" || p.startsWith("/ai/")) return next();
+  const hit = duckPrefixes.some((pre) => p === pre || p.startsWith(`${pre}/`));
+  if (!hit) return next();
+  // /dm/* → /* so the same handler works under an explicit prefix
+  if (p === "/dm" || p.startsWith("/dm/")) {
+    const url = new URL(c.req.url);
+    url.pathname = p === "/dm" ? "/" : p.slice(3);
+    return duck.fetch(new Request(url.toString(), c.req.raw));
+  }
+  return duck.fetch(c.req.raw);
+});
 
 const SESSION_COOKIE = "tm_session";
 
@@ -243,20 +298,53 @@ app.post("/api/domains", requireUser, async (c) => {
   const user = c.get("user");
   const body = await c.req.json().catch(() => ({}));
   try {
-    const domain = await db.addDomain(user.id, String(body.domain || ""), String(body.note || ""));
+    const visibility =
+      body.visibility === "public" || body.visibility === "private"
+        ? body.visibility
+        : "private";
+    const domain = await db.addDomain(
+      user.id,
+      String(body.domain || ""),
+      String(body.note || ""),
+      visibility,
+    );
     await db.addAudit({
       actorId: user.id,
       actorUsername: user.username,
       action: "create",
       resource: "domain",
       resourceId: domain.id,
-      detail: domain.domain,
+      detail: `${domain.domain} (${domain.visibility})`,
       ip: clientIp(c),
     });
     return c.json({ ok: true, domain }, 201);
   } catch (err) {
     return c.json({ error: err instanceof Error ? err.message : "添加失败" }, 400);
   }
+});
+
+app.patch("/api/domains/:id", requireUser, async (c) => {
+  const user = c.get("user");
+  const domainId = c.req.param("id") || "";
+  const body = await c.req.json().catch(() => ({}));
+  const domain = await db.updateDomain(user.id, domainId, {
+    note: body.note !== undefined ? String(body.note) : undefined,
+    visibility:
+      body.visibility === "public" || body.visibility === "private"
+        ? body.visibility
+        : undefined,
+  });
+  if (!domain) return c.json({ error: "未找到域名" }, 404);
+  await db.addAudit({
+    actorId: user.id,
+    actorUsername: user.username,
+    action: "update",
+    resource: "domain",
+    resourceId: domain.id,
+    detail: `${domain.domain} visibility=${domain.visibility}`,
+    ip: clientIp(c),
+  });
+  return c.json({ ok: true, domain });
 });
 
 app.delete("/api/domains/:id", requireUser, async (c) => {
@@ -273,6 +361,155 @@ app.delete("/api/domains/:id", requireUser, async (c) => {
     ip: clientIp(c),
   });
   return c.json({ ok: true });
+});
+
+// ---------- personal: API keys + call history + docs ----------
+function parseScopes(raw: unknown): ApiKeyScope[] {
+  if (!Array.isArray(raw)) return ["read", "write"];
+  const out: ApiKeyScope[] = [];
+  for (const s of raw) {
+    if (s === "read" || s === "write") out.push(s);
+  }
+  return out.length ? [...new Set(out)] : ["read", "write"];
+}
+
+app.get("/api/settings/api-keys", requireUser, (c) => {
+  // legacy path — same as /api/me/api-keys
+  const user = c.get("user");
+  return c.json({ items: db.listUserApiKeys(user.id) });
+});
+
+app.get("/api/me/api-keys", requireUser, (c) => {
+  const user = c.get("user");
+  return c.json({ items: db.listUserApiKeys(user.id) });
+});
+
+app.post("/api/me/api-keys", requireUser, async (c) => {
+  const user = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  try {
+    const created = await db.createUserApiKey(
+      user.id,
+      String(body.name || ""),
+      parseScopes(body.scopes),
+    );
+    await db.addAudit({
+      actorId: user.id,
+      actorUsername: user.username,
+      action: "create",
+      resource: "api_key",
+      resourceId: created.id,
+      detail: `${created.name} scopes=${created.scopes.join(",")}`,
+      ip: clientIp(c),
+    });
+    return c.json({ ok: true, key: created }, 201);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "创建失败" }, 400);
+  }
+});
+
+// keep legacy create path
+app.post("/api/settings/api-keys", requireUser, async (c) => {
+  const user = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  try {
+    const created = await db.createUserApiKey(
+      user.id,
+      String(body.name || ""),
+      parseScopes(body.scopes),
+    );
+    return c.json({ ok: true, key: created }, 201);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "创建失败" }, 400);
+  }
+});
+
+app.patch("/api/me/api-keys/:id", requireUser, async (c) => {
+  const user = c.get("user");
+  const keyId = c.req.param("id") || "";
+  const body = await c.req.json().catch(() => ({}));
+  try {
+    const item = await db.updateUserApiKey(user.id, keyId, {
+      name: body.name !== undefined ? String(body.name) : undefined,
+      scopes: body.scopes !== undefined ? parseScopes(body.scopes) : undefined,
+      status: body.status === "active" || body.status === "revoked" ? body.status : undefined,
+    });
+    if (!item) return c.json({ error: "未找到 API Key" }, 404);
+    return c.json({
+      ok: true,
+      key: {
+        id: item.id,
+        name: item.name,
+        scopes: item.scopes,
+        status: item.status,
+        keyPreview: `${item.key.slice(0, 6)}…${item.key.slice(-4)}`,
+        createdAt: item.createdAt,
+        lastUsedAt: item.lastUsedAt,
+      },
+    });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "更新失败" }, 400);
+  }
+});
+
+app.delete("/api/me/api-keys/:id", requireUser, async (c) => {
+  const user = c.get("user");
+  const keyId = c.req.param("id") || "";
+  const ok = await db.deleteUserApiKey(user.id, keyId);
+  if (!ok) return c.json({ error: "未找到 API Key" }, 404);
+  await db.addAudit({
+    actorId: user.id,
+    actorUsername: user.username,
+    action: "delete",
+    resource: "api_key",
+    resourceId: keyId,
+    ip: clientIp(c),
+  });
+  return c.json({ ok: true });
+});
+
+app.delete("/api/settings/api-keys/:id", requireUser, async (c) => {
+  const user = c.get("user");
+  const keyId = c.req.param("id") || "";
+  const ok = await db.deleteUserApiKey(user.id, keyId);
+  if (!ok) return c.json({ error: "未找到 API Key" }, 404);
+  return c.json({ ok: true });
+});
+
+app.get("/api/me/api-history", requireUser, (c) => {
+  const user = c.get("user");
+  const { q, page, pageSize } = pageParams(c);
+  return c.json(db.listApiCallLogs(user.id, { q, page, pageSize }));
+});
+
+app.get("/api/me/api-docs", requireUser, (c) => {
+  const base = config.PUBLIC_URL.replace(/\/$/, "");
+  return c.json({
+    openapiUrl: `${base}/ai/v1/openapi.json`,
+    skillUrl: `${base}/ai/v1/skill`,
+    docsUrl: `${base}/ai/v1/docs`,
+    baseUrl: base,
+    auth: "Authorization: Bearer dk_…",
+    scopes: {
+      read: "GET /ai/v1/me, domains, mails, inbound, history",
+      write: "POST/PATCH/DELETE mutating routes under /ai/v1",
+    },
+    endpoints: {
+      me: `${base}/ai/v1/me`,
+      domains: `${base}/ai/v1/domains`,
+      mails: `${base}/ai/v1/mails`,
+      inbound: `${base}/ai/v1/inbound`,
+      history: `${base}/ai/v1/history`,
+      skill: `${base}/ai/v1/skill`,
+      openapi: `${base}/ai/v1/openapi.json`,
+    },
+    duckmail: {
+      domains: `${base}/domains`,
+      accounts: `${base}/accounts`,
+      token: `${base}/token`,
+      messages: `${base}/messages`,
+    },
+  });
 });
 
 // ---------- mails (tenant) ----------
@@ -533,7 +770,8 @@ app.post(
     const channel = (c.req.header("x-channel") || "default").toLowerCase().trim();
     if (!tenant) return c.json({ error: "missing x-tenant" }, 400);
 
-    if (!db.findUserByTenant(tenant)) {
+    // Accept SaaS dashboard users OR DuckMail-compatible mailbox accounts
+    if (!db.isKnownTenant(tenant)) {
       return c.json({ error: "unknown tenant", tenant }, 403);
     }
 
