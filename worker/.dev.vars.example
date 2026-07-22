@@ -1,0 +1,2 @@
+WEBHOOK_SECRET=change-me-to-a-long-random-secret
+# FALLBACK_EMAIL=you@example.com

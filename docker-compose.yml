@@ -1,0 +1,41 @@
+services:
+  mail-api:
+    build: ./server
+    container_name: touch-mail-router
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8788:8788"
+    environment:
+      PORT: "8788"
+      HOST: "0.0.0.0"
+      DATA_DIR: /data
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      PUBLIC_URL: ${PUBLIC_URL:-https://mail.wc1.tagzxia.com}
+      INBOUND_DOMAIN: ${INBOUND_DOMAIN:-inbound.wc1.tagzxia.com}
+      APP_NAME: ${APP_NAME:-TouchMail}
+      COOKIE_SECURE: "true"
+      MAX_BODY_BYTES: "16777216"
+    volumes:
+      - mail-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8788/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  mail-admin:
+    build: ./admin
+    container_name: touch-mail-admin
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      PORT: "3000"
+      # Browser hits admin origin; Next rewrites /api → API service
+      API_PROXY_TARGET: http://mail-api:8788
+    depends_on:
+      - mail-api
+
+volumes:
+  mail-data:

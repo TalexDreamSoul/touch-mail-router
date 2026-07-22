@@ -1,0 +1,24 @@
+name = "touch-mail-router"
+main = "src/index.ts"
+compatibility_date = "2026-06-25"
+workers_dev = true
+
+# 非密钥配置。密钥用 wrangler secret put：
+#   WEBHOOK_SECRET
+#   FALLBACK_EMAIL（可选，已验证的 CF destination，失败时转发保底）
+[vars]
+# 你的云端入站接口（HTTPS）
+WEBHOOK_URL = "https://mail-api.example.com/v1/inbound"
+# 入站域名，用于校验 message.to（可逗号分隔多个）
+INBOUND_DOMAINS = "inbound.example.com"
+# 签名时间窗（秒）
+SIGNATURE_SKEW_SECONDS = "300"
+# 推送失败时是否 reject（永久拒收）。false 时抛错让平台重试
+REJECT_ON_FAILURE = "false"
+# 超过该大小（字节）的邮件直接 reject，避免拖垮 webhook
+MAX_EMAIL_BYTES = "15728640"
+
+# 可选：R2 存超大原信（后续扩展）
+# [[r2_buckets]]
+# binding = "RAW_BUCKET"
+# bucket_name = "touch-mail-raw"

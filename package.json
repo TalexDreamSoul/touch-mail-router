@@ -1,0 +1,13 @@
+{
+  "name": "touch-mail-router",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Cloudflare Email Worker → HTTPS SaaS mail router with Next.js admin",
+  "scripts": {
+    "dev:api": "npm --prefix server run dev",
+    "dev:admin": "npm --prefix admin run dev",
+    "build:api": "npm --prefix server run build",
+    "build:admin": "npm --prefix admin run build",
+    "typecheck:api": "npm --prefix server run typecheck"
+  }
+}
