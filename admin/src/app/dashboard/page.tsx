@@ -1,14 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Badge, ClipboardText, LayerCard, Text } from "@cloudflare/kumo";
+import { Badge, LayerCard, Text } from "@cloudflare/kumo";
 import { AdminShell } from "@/components/admin-shell";
 import { PageHeader } from "@/components/page-header";
 import { api, formatDate, type MailMeta } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 
 type Dash = {
-  inboundAddress?: string;
   domainCount?: number;
   mailCount?: number;
   lastMailAt?: string | null;
@@ -63,21 +62,12 @@ export default function DashboardPage() {
 
       <div className="grid gap-4 lg:grid-cols-2">
         <LayerCard>
-          <LayerCard.Secondary>入站地址</LayerCard.Secondary>
+          <LayerCard.Secondary>域名接入</LayerCard.Secondary>
           <LayerCard.Primary>
             <div className="flex flex-col gap-3">
-              {data?.inboundAddress ? (
-                <ClipboardText
-                  text={data.inboundAddress}
-                  size="base"
-                  tooltip={{ text: "复制", copiedText: "已复制" }}
-                  labels={{ copyAction: "复制入站地址" }}
-                />
-              ) : (
-                <Text variant="secondary">加载中…</Text>
-              )}
+              <Text size="sm">收件渠道由管理员统一发布</Text>
               <Text variant="secondary" size="sm">
-                客户把邮箱完整转发到该地址，即可经 Cloudflare Worker 入站。
+                在“域名”页面选择 Worker、邮箱转发、DoneMail 或 API 上报渠道，并按渠道教程完成配置。Worker 直连不需要邮箱转发。
               </Text>
             </div>
           </LayerCard.Primary>

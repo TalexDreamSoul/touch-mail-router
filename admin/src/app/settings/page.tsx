@@ -2,7 +2,6 @@
 
 import {
   Button,
-  ClipboardText,
   LayerCard,
   Text,
 } from "@cloudflare/kumo";
@@ -47,18 +46,9 @@ export default function SettingsPage() {
               </div>
               <div>
                 <Text size="xs" variant="secondary">
-                  入站地址
+                  收件方式
                 </Text>
-                {user?.inboundAddress ? (
-                  <ClipboardText
-                    text={user.inboundAddress}
-                    size="sm"
-                    tooltip={{ text: "复制", copiedText: "已复制" }}
-                    labels={{ copyAction: "复制" }}
-                  />
-                ) : (
-                  <Text size="sm">—</Text>
-                )}
+                <Text size="sm">按域名选择管理员收件渠道</Text>
               </div>
             </div>
             <div className="mt-4">

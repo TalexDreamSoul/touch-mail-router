@@ -7,10 +7,30 @@ export type User = {
   status: "active" | "disabled";
   createdAt: string;
   updatedAt?: string;
-  inboundAddress: string;
 };
 
 export type DomainVisibility = "public" | "private";
+export type ReceiveChannelType = "worker" | "email_forward" | "donemail" | "api_push";
+
+export type ReceiveChannel = {
+  id: string;
+  name: string;
+  description: string;
+  type: ReceiveChannelType;
+  enabled: boolean;
+  forwardingAddressTemplate: string;
+  baseUrl: string;
+  adminKey: string;
+  pushToken: string;
+  adminKeySet: boolean;
+  pushTokenSet: boolean;
+  pollIntervalSeconds: number;
+  lastSyncAt: string | null;
+  lastSyncError: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy: string;
+};
 
 export type Domain = {
   id: string;
@@ -18,6 +38,8 @@ export type Domain = {
   domain: string;
   note: string;
   visibility: DomainVisibility;
+  receiveChannelId: string | null;
+  workerName: string;
   createdAt: string;
   username?: string;
   tenant?: string;
@@ -113,6 +135,27 @@ export type FeishuSettings = {
   verificationTokenSet?: boolean;
 };
 
+export type SmtpSettings = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  username: string;
+  password: string;
+  fromAddress: string;
+  fromName: string;
+  replyTo: string;
+  updatedAt: string | null;
+  updatedBy: string | null;
+  passwordSet?: boolean;
+};
+
+export type SmtpStatus = {
+  enabled: boolean;
+  fromAddress: string;
+  fromName: string;
+};
+
 export type PageResult<T> = {
   items: T[];
   total: number;
@@ -121,13 +164,50 @@ export type PageResult<T> = {
 };
 
 export type WorkerSnippet = {
-  tenant: string;
-  inboundAddress: string;
+  domainId: string;
+  domain: string;
+  workerName: string;
   webhookUrl: string;
+  webhookSecret: string;
   js: string;
   wranglerToml: string;
   setupSteps: string[];
+  routeSteps: string[];
 };
+
+export type FeishuChat = {
+  chatId: string;
+  name: string;
+  description: string;
+  avatar: string;
+};
+
+export type FeishuTestFailureDetails = {
+  kind: "validation" | "remote" | "network" | "timeout";
+  phase: string;
+  endpoint?: string;
+  method?: string;
+  request?: unknown;
+  secretSource?: "current_input" | "saved" | "missing";
+  upstreamStatus?: number;
+  feishuCode?: number | string;
+  responseHeaders?: Record<string, string>;
+  response?: unknown;
+  suggestion?: string;
+  durationMs?: number;
+  occurredAt?: string;
+};
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly data: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
@@ -150,9 +230,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw err instanceof Error ? err : new Error(msg);
   }
-  const data = await res.json().catch(() => ({}));
+  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) {
-    throw new Error((data as { error?: string }).error || `请求失败 ${res.status}`);
+    throw new ApiError(
+      typeof data.error === "string" ? data.error : `请求失败 ${res.status}`,
+      res.status,
+      data,
+    );
   }
   return data as T;
 }
@@ -177,16 +261,23 @@ export const api = {
     request<PageResult<Domain>>(`/api/domains?${params}`),
   createDomain: (
     domain: string,
-    note?: string,
-    visibility: DomainVisibility = "private",
+    note: string,
+    visibility: DomainVisibility,
+    receiveChannelId: string,
+    workerName: string,
   ) =>
     request<{ ok: boolean; domain: Domain }>("/api/domains", {
       method: "POST",
-      body: JSON.stringify({ domain, note, visibility }),
+      body: JSON.stringify({ domain, note, visibility, receiveChannelId, workerName }),
     }),
   updateDomain: (
     id: string,
-    body: Partial<{ note: string; visibility: DomainVisibility }>,
+    body: Partial<{
+      note: string;
+      visibility: DomainVisibility;
+      receiveChannelId: string;
+      workerName: string;
+    }>,
   ) =>
     request<{ ok: boolean; domain: Domain }>(`/api/domains/${id}`, {
       method: "PATCH",
@@ -196,7 +287,24 @@ export const api = {
     request<{ ok: boolean }>(`/api/domains/${id}`, { method: "DELETE" }),
   mails: (params: URLSearchParams) =>
     request<PageResult<MailMeta>>(`/api/mails?${params}`),
-  workerSnippet: () => request<WorkerSnippet>("/api/worker-snippet"),
+  receiveChannels: () => request<{ items: ReceiveChannel[] }>("/api/receive-channels"),
+  workerSnippet: (domainId: string) =>
+    request<WorkerSnippet>(`/api/domains/${domainId}/worker-snippet`),
+  smtpStatus: () => request<SmtpStatus>("/api/smtp/status"),
+  sendMail: (body: { to: string; subject: string; text: string; html?: string }) =>
+    request<{ ok: boolean; messageId: string; accepted: string[]; rejected: string[] }>(
+      "/api/outbound",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  sendDomainTest: (domainId: string, recipient: string) =>
+    request<{ ok: boolean; token: string; recipient: string; messageId: string }>(
+      `/api/domains/${domainId}/test`,
+      { method: "POST", body: JSON.stringify({ recipient }) },
+    ),
+  domainTestStatus: (domainId: string, token: string) =>
+    request<{ received: boolean; mail: MailMeta | null }>(
+      `/api/domains/${domainId}/test/${token}`,
+    ),
 
   listApiKeys: () => request<{ items: UserApiKey[] }>("/api/me/api-keys"),
   createApiKey: (name?: string, scopes: ApiKeyScope[] = ["read", "write"]) =>
@@ -254,11 +362,67 @@ export const api = {
     request<PageResult<MailMeta>>(`/api/admin/mails?${params}`),
   auditLogs: (params: URLSearchParams) =>
     request<PageResult<AuditLog>>(`/api/admin/audit-logs?${params}`),
+  adminReceiveChannels: () =>
+    request<{ items: ReceiveChannel[] }>("/api/admin/receive-channels"),
+  createReceiveChannel: (body: {
+    name: string;
+    description?: string;
+    type: ReceiveChannelType;
+    enabled: boolean;
+    forwardingAddressTemplate?: string;
+    baseUrl?: string;
+    adminKey?: string;
+    pushToken?: string;
+    pollIntervalSeconds?: number;
+  }) =>
+    request<{ ok: boolean; channel: ReceiveChannel; pushToken?: string }>(
+      "/api/admin/receive-channels",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  updateReceiveChannel: (id: string, body: Partial<ReceiveChannel>) =>
+    request<{ ok: boolean; channel: ReceiveChannel }>(`/api/admin/receive-channels/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteReceiveChannel: (id: string) =>
+    request<{ ok: boolean }>(`/api/admin/receive-channels/${id}`, { method: "DELETE" }),
+  testReceiveChannel: (id: string) =>
+    request<{ ok: boolean; result: Record<string, unknown> }>(
+      `/api/admin/receive-channels/${id}/test`,
+      { method: "POST" },
+    ),
+  syncReceiveChannel: (id: string) =>
+    request<{
+      ok: boolean;
+      result: { imported: number; duplicates: number; skipped: number };
+    }>(`/api/admin/receive-channels/${id}/sync`, { method: "POST" }),
+  smtpSettings: () =>
+    request<{ settings: SmtpSettings }>("/api/admin/settings/smtp"),
+  saveSmtpSettings: (body: Partial<SmtpSettings>) =>
+    request<{ ok: boolean; settings: SmtpSettings }>("/api/admin/settings/smtp", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  testSmtpSettings: (body: Partial<SmtpSettings>) =>
+    request<{ ok: boolean }>("/api/admin/settings/smtp/test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   feishuSettings: () =>
     request<{ settings: FeishuSettings }>("/api/admin/settings/feishu"),
   saveFeishuSettings: (body: Partial<FeishuSettings>) =>
     request<{ ok: boolean; settings: FeishuSettings }>("/api/admin/settings/feishu", {
       method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  testFeishuSettings: (body: Pick<FeishuSettings, "appId" | "appSecret" | "notifyChatId">) =>
+    request<{ ok: boolean; messageSent: boolean }>("/api/admin/settings/feishu/test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listFeishuChats: (body: Pick<FeishuSettings, "appId" | "appSecret">) =>
+    request<{ ok: boolean; items: FeishuChat[] }>("/api/admin/settings/feishu/chats", {
+      method: "POST",
       body: JSON.stringify(body),
     }),
 };

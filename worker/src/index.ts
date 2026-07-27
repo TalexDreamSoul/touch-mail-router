@@ -4,15 +4,17 @@
  * 收信入口：Cloudflare Email Routing → email() handler
  * 再 HTTPS 推送到你的云端 /v1/inbound
  *
- * 客户接入（长期可用的「转发」方案）：
- *   客户把 support@客户域 转发到  {tenant}@inbound.你的域
- *   或  {tenant}+{channel}@inbound.你的域
+ * 客户接入：在客户域名的 Cloudflare Email Routing 中，
+ * 将 Custom address 或 Catch-all 的动作设为 Send to a Worker。
+ * 不需要先转发到另一个邮箱。
  */
 
 export interface Env {
   WEBHOOK_URL: string;
   WEBHOOK_SECRET: string;
-  INBOUND_DOMAINS: string;
+  EMAIL_DOMAIN: string;
+  /** 邮箱转发渠道 ID；每域直连 Worker 可留空 */
+  RECEIVE_CHANNEL_ID?: string;
   SIGNATURE_SKEW_SECONDS?: string;
   REJECT_ON_FAILURE?: string;
   MAX_EMAIL_BYTES?: string;
@@ -38,7 +40,7 @@ export default {
         ok: true,
         service: "touch-mail-router",
         mode: "email-worker",
-        inboundDomains: splitCsv(env.INBOUND_DOMAINS),
+        inboundDomain: String(env.EMAIL_DOMAIN || "").trim().toLowerCase(),
       });
     }
     return new Response("Not Found", { status: 404 });
@@ -72,26 +74,16 @@ export default {
       return;
     }
 
-    const domains = splitCsv(env.INBOUND_DOMAINS).map((d) => d.toLowerCase());
+    const acceptedDomain = String(env.EMAIL_DOMAIN || "").trim().toLowerCase();
     const parsed = parseRecipient(to);
     if (!parsed) {
       message.setReject("Invalid recipient address");
       return;
     }
 
-    if (domains.length > 0 && !domains.includes(parsed.domain)) {
+    if (!acceptedDomain || parsed.domain !== acceptedDomain) {
       console.warn("recipient domain not allowed", parsed.domain);
       message.setReject("Recipient domain not accepted");
-      return;
-    }
-
-    if (!parsed.tenant || parsed.tenant === "postmaster" || parsed.tenant === "abuse") {
-      // 系统地址：可按需处理；默认丢弃
-      if (parsed.tenant === "postmaster" || parsed.tenant === "abuse") {
-        console.log("system address ignored", parsed.tenant);
-        return;
-      }
-      message.setReject("Missing tenant in local-part");
       return;
     }
 
@@ -122,9 +114,10 @@ export default {
       "x-email-subject": encodeHeaderValue(subject),
       "x-message-id": messageId,
       "x-tenant": parsed.tenant,
-      "x-channel": parsed.channel,
+      "x-channel": "worker",
+      "x-receive-channel-id": String(env.RECEIVE_CHANNEL_ID || ""),
       "x-email-size": String(message.rawSize),
-      "user-agent": "touch-mail-router-worker/0.1",
+      "user-agent": "touch-mail-router-worker/0.3",
     };
 
     // 透传若干有用头，便于云端还原转发场景
@@ -189,14 +182,6 @@ export default {
     await fail(message, env, `Webhook HTTP ${response.status}`);
   },
 } satisfies ExportedHandler<Env>;
-
-function splitCsv(value: string | undefined): string[] {
-  if (!value) return [];
-  return value
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
 
 /**
  * 支持：

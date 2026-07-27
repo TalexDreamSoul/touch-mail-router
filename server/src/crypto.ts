@@ -37,3 +37,10 @@ export function verifySignature(opts: {
 
   return { ok: true };
 }
+
+
+export function deriveDomainWebhookSecret(masterSecret: string, domainId: string): string {
+  return createHmac("sha256", masterSecret)
+    .update(`domain-webhook:${domainId}`)
+    .digest("base64url");
+}

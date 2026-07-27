@@ -17,7 +17,6 @@ import {
 } from "@phosphor-icons/react";
 import {
   Badge,
-  Button,
   DropdownMenu,
   Loader,
   Sidebar,
@@ -25,7 +24,7 @@ import {
   Text,
 } from "@cloudflare/kumo";
 import { useAuth } from "@/lib/auth";
-import { useTheme, type ThemeMode } from "@/lib/theme";
+import { useTheme } from "@/lib/theme";
 import type { ReactNode } from "react";
 
 type NavItem = {
@@ -47,6 +46,7 @@ const navGroups: NavGroup[] = [
       { href: "/dashboard", label: "概览", icon: HouseIcon },
       { href: "/domains", label: "域名", icon: GlobeIcon },
       { href: "/mails", label: "邮件", icon: EnvelopeSimpleIcon },
+      { href: "/send", label: "发邮件", icon: EnvelopeSimpleIcon, admin: true },
     ],
   },
   {
@@ -61,6 +61,8 @@ const navGroups: NavGroup[] = [
     items: [
       { href: "/users", label: "用户管理", icon: UsersIcon, admin: true },
       { href: "/audit", label: "审计日志", icon: ListBulletsIcon, admin: true },
+      { href: "/settings/receivers", label: "收件渠道", icon: GlobeIcon, admin: true },
+      { href: "/settings/smtp", label: "SMTP 配置", icon: EnvelopeSimpleIcon, admin: true },
       { href: "/settings/feishu", label: "飞书配置", icon: GearIcon, admin: true },
     ],
   },

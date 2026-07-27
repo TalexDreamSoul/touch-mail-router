@@ -1,23 +1,19 @@
 # touch-mail-router
 
-**Cloudflare Email Worker → 你的云端 HTTPS API** 的入站邮件网关 + **Next.js / Kumo 管理后台**。
+**多收件渠道邮件网关 + SMTP 发信 + Next.js / Kumo 管理后台**。
 
-面向「客户自有域名用邮箱转发接入」的长期方案：
+管理员先发布收件渠道，用户绑定域名时只能从已启用渠道中选择：
 
 ```
-发件人
-  → 客户邮箱 support@customer.com
-  → 客户设置自动转发
-  → {tenant}@inbound.你的域   （或 tenant+channel@）
-  → Cloudflare Email Routing
-  → Email Worker（本仓库 worker/）
-  → HTTPS POST /v1/inbound
-  → 云端 API（本仓库 server/）
-  → 落盘 / 审计日志 / 可选飞书通知配置
-  → 管理后台（本仓库 admin/，Next.js + @cloudflare/kumo）
+Cloudflare Email Routing → Send to a Worker → POST /v1/inbound
+业务邮箱 → 转发到管理员地址模板 → 系统入站 Worker → POST /v1/inbound
+DoneMail → Touch Mail 定时 GET /api/mails → 去重入库
+上游系统 → POST /v1/inbound/json/:channelId → 去重入库
 ```
 
-**不需要 25 端口。** 你的服务器只开 443。
+出站邮件统一使用管理员 SMTP 配置；域名接入向导会自动发送测试邮件并等待它从所选渠道回到系统。
+
+**不需要开放 25 端口。** API 与管理后台只需 HTTPS；SMTP 使用管理员配置的外部服务。
 
 ---
 
@@ -26,7 +22,7 @@
 ```
 touch-mail-router/
 ├── admin/                  # Next.js 15 + @cloudflare/kumo 管理后台
-│   ├── src/app/            # 登录 / 概览 / 用户 / 域名 / 邮件 / 审计 / 飞书配置
+│   ├── src/app/            # 登录 / 域名 / 收发邮件 / 用户 / 审计 / 收件渠道 / SMTP / 飞书
 │   └── Dockerfile
 ├── worker/                 # Cloudflare Email Worker
 │   ├── src/index.ts
@@ -49,10 +45,13 @@ touch-mail-router/
 | `/login` | 注册 / 登录（Cookie Session） |
 | `/dashboard` | 租户概览；管理员可见全站统计 |
 | `/users` | **管理员** 用户 CRUD、角色、启用/禁用，搜索 + 分页 |
-| `/domains` | 域名台账 CRUD，搜索 + 分页（管理员看全站） |
+| `/domains` | 域名绑定、收件渠道选择、Worker/转发/API 指引、SMTP 自动接入测试 |
 | `/mails` | 入站邮件列表，搜索 + 分页 |
+| `/send` | **管理员**使用统一 SMTP 配置发送邮件 |
 | `/audit` | **管理员** 审计日志，搜索 + 分页 |
-| `/settings/feishu` | **管理员** 飞书 SaaS 配置（App ID/Secret、加密、通知群、入站通知开关） |
+| `/settings/receivers` | **管理员** Worker、邮箱转发、DoneMail、API 上报渠道管理 |
+| `/settings/smtp` | **管理员** SMTP 连接、发件身份、启用状态与连接测试 |
+| `/settings/feishu` | **管理员** 飞书 SaaS 配置 |
 
 首个注册用户自动成为 `admin`。
 
@@ -60,16 +59,14 @@ touch-mail-router/
 
 ---
 
-## 地址约定
+## 接入约定
 
-| 地址 | 含义 |
-|------|------|
-| `acme@inbound.example.com` | 租户 `acme`，渠道 `default` |
-| `acme+orders@inbound.example.com` | 租户 `acme`，渠道 `orders` |
+- **Worker 直连**：客户域 Cloudflare Email Routing 的动作选择 `Send to a Worker`，不需要邮箱转发。系统生成 Worker Name、代码、独立 Secret 和路由规则教程；Worker Name 必须在代码、Wrangler 与路由规则三处一致。
+- **邮箱转发**：管理员配置包含 `{tenant}` 的目标模板，例如 `{tenant}@inbound.example.com`；创建渠道时系统生成独立渠道 ID 与签名 Token，中央 Worker 使用二者签名入站请求。用户只看到渲染后的具体转发地址。
+- **DoneMail**：管理员配置站点 Base URL 与 `X-Admin-Key`，系统调用 `GET /api/mails`，按收件域名匹配用户并持久化。
+- **API 上报**：上游使用渠道 Token 调用 JSON 入站接口。
 
-客户文档一句话：
-
-> 请把 `support@你的公司域名` **完整转发**到我们给你的地址：`xxx@inbound.example.com`
+一个域名同一时间绑定一个收件渠道，避免多通道重复入库。升级前创建的未绑定域名会保持未绑定状态，管理员需要在域名页显式选择新渠道；旧版全局 Worker Secret 不再接受。
 
 ---
 
@@ -121,7 +118,7 @@ curl -s http://127.0.0.1:8788/health
 
 - OpenResty / Caddy / Nginx 将 `https://mail...` 反代到 Admin `:3000`
 - 或 API 与 Admin 同域分路径（Admin rewrite `/api` → `mail-api:8788`）
-- Worker 的 `WEBHOOK_SECRET` 与 API 一致
+- 每域直连 Worker 使用域名向导生成的独立 `WEBHOOK_SECRET`；邮箱转发 Worker 使用收件渠道生成的独立 Token，不再接受旧版全局 Secret
 
 ---
 
@@ -175,23 +172,30 @@ curl "$PUBLIC_URL/messages" -H "Authorization: Bearer <token>"
 | `GET` | `/api/config` | 公开配置 |
 | `POST` | `/api/auth/register` | 注册 |
 | `POST` | `/api/auth/login` | 登录 |
-| `POST` | `/api/auth/logout` | 登出 |
-| `GET` | `/api/auth/me` | 当前用户 |
-| `GET` | `/api/dashboard` | 概览 |
-| `GET/POST` | `/api/domains` | 域名列表 / 添加（支持 `q,page,pageSize`） |
-| `DELETE` | `/api/domains/:id` | 删除域名 |
-| `GET` | `/api/mails` | 邮件列表（搜索分页） |
-| `GET` | `/api/worker-snippet` | 生成 Worker 代码片段 |
-| `POST` | `/v1/inbound` | Worker 推送入口（HMAC 验签） |
+| `GET/POST/PATCH/DELETE` | `/api/domains*` | 域名与收件渠道绑定 |
+| `GET` | `/api/receive-channels` | 当前用户可选的已启用渠道 |
+| `GET` | `/api/domains/:id/worker-snippet` | 每域 Worker Name、代码、Secret 与路由教程 |
+| `POST` | `/api/domains/:id/test` | SMTP 发送域名接入测试邮件 |
+| `GET` | `/api/domains/:id/test/:token` | 查询测试邮件是否入站 |
+| `GET` | `/api/mails` | 当前租户邮件列表 |
+| `GET` | `/api/smtp/status` | SMTP 可用状态与发件身份 |
+| `POST` | `/api/outbound` | **管理员**使用 SMTP 配置发信 |
+| `POST` | `/v1/inbound` | Worker RFC822 入站（HMAC） |
+| `POST` | `/v1/inbound/json/:channelId` | API 渠道 JSON 入站（Bearer Token） |
 
 ### 管理员
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| `GET/POST` | `/api/admin/receive-channels` | 收件渠道列表 / 创建 |
+| `PATCH/DELETE` | `/api/admin/receive-channels/:id` | 收件渠道修改 / 删除 |
+| `POST` | `/api/admin/receive-channels/:id/test` | 渠道连接测试 |
+| `POST` | `/api/admin/receive-channels/:id/sync` | 立即同步 DoneMail |
+| `GET/PUT` | `/api/admin/settings/smtp` | SMTP 配置 |
+| `POST` | `/api/admin/settings/smtp/test` | SMTP 连接测试 |
 | `GET` | `/api/admin/overview` | 全站概览 |
-| `GET/POST` | `/api/admin/users` | 用户列表 / 创建 |
-| `PATCH/DELETE` | `/api/admin/users/:id` | 更新 / 删除用户 |
-| `GET` | `/api/admin/domains` | 全站域名 |
+| `GET/POST/PATCH/DELETE` | `/api/admin/users*` | 用户管理 |
+| `GET/DELETE` | `/api/admin/domains*` | 全站域名管理 |
 | `GET` | `/api/admin/mails` | 全站邮件 |
 | `GET` | `/api/admin/audit-logs` | 审计日志 |
 | `GET/PUT` | `/api/admin/settings/feishu` | 飞书配置 |
@@ -213,28 +217,30 @@ Headers:
 
 ## 4. Cloudflare Worker
 
-见 `worker/`：
+仓库 `worker/` 提供管理员自建 Worker；域名向导还会为用户绑定的单个域名生成可复制代码与 `wrangler.toml`。
 
 ```bash
 cd worker
-# 配置 wrangler.toml 与 WEBHOOK_SECRET
+# 配置 WEBHOOK_URL / EMAIL_DOMAIN；邮箱转发 Worker 还需 RECEIVE_CHANNEL_ID
+# WEBHOOK_SECRET 使用域名向导或收件渠道提供的独立 Token
+npx wrangler secret put WEBHOOK_SECRET
 npx wrangler deploy
 ```
 
-在 Cloudflare Dashboard 为入站域开启 Email Routing，绑定本 Worker。
+客户域直连时，在 Cloudflare Dashboard 打开 **Email Routing → Routing rules**：
 
----
+1. 创建 Custom address，或启用 Catch-all；
+2. Action 选择 **Send to a Worker**，不是 **Forward to an email**；
+3. 选择与域名向导显示完全一致的 Worker Name；
+4. 保存后使用向导的 SMTP 自动测试验证整条链路。
 
-## 5. 飞书 SaaS 配置
+## 5. SMTP 发信
 
-在后台 **飞书配置** 页填写：
+管理员在 `/settings/smtp` 配置 Host、Port、TLS、认证信息和发件身份。端口 `465` 通常使用隐式 TLS；`587` 通常使用 STARTTLS。仅管理员可在 `/send` 任意发信；普通用户只能通过域名向导向自己绑定的域名发送接入测试邮件。
 
-- App ID / App Secret（企业自建应用）
-- Encrypt Key / Verification Token（事件订阅）
-- 通知群 Chat ID、入站通知开关
-- OAuth Redirect URI（预留）
+## 6. 飞书 SaaS 配置
 
-密钥字段保存时若为掩码 `••••` 则不覆盖原值。当前版本完成配置持久化与审计；实际飞书消息推送可在此配置基础上继续扩展。
+在后台 **飞书配置** 页填写 App ID / Secret、事件订阅字段、通知群与 OAuth Redirect URI。密钥字段保存时若为掩码 `••••` 则不覆盖原值；启用“入站邮件通知”后，Worker、API Push 和 DoneMail 新邮件会异步推送到所选群，推送失败不影响邮件入库。
 
 ---
 

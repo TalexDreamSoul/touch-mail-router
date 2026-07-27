@@ -1,5 +1,5 @@
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, writeFile, rename, appendFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, appendFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 export type UserRole = "admin" | "user";
@@ -18,6 +18,33 @@ export interface User {
 
 export type DomainVisibility = "public" | "private";
 
+export type ReceiveChannelType = "worker" | "email_forward" | "donemail" | "api_push";
+
+export interface ReceiveChannel {
+  id: string;
+  name: string;
+  description: string;
+  type: ReceiveChannelType;
+  enabled: boolean;
+  forwardingAddressTemplate: string;
+  baseUrl: string;
+  adminKey: string;
+  pushToken: string;
+  pollIntervalSeconds: number;
+  lastSyncAt: string | null;
+  lastSyncError: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export type PublicReceiveChannel = Omit<ReceiveChannel, "adminKey" | "pushToken"> & {
+  adminKey: string;
+  pushToken: string;
+  adminKeySet: boolean;
+  pushTokenSet: boolean;
+};
+
 export interface Domain {
   id: string;
   userId: string;
@@ -25,6 +52,8 @@ export interface Domain {
   note: string;
   /** public: listed on DuckMail /domains without key; private: needs owner's API key */
   visibility: DomainVisibility;
+  receiveChannelId: string | null;
+  workerName: string;
   createdAt: string;
 }
 
@@ -110,6 +139,20 @@ export interface FeishuSettings {
   updatedBy: string | null;
 }
 
+export interface SmtpSettings {
+  enabled: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  username: string;
+  password: string;
+  fromAddress: string;
+  fromName: string;
+  replyTo: string;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
 /** DuckMail-compatible mailbox account (address + password + bearer tokens) */
 export interface MailAccount {
   id: string;
@@ -139,6 +182,7 @@ export interface MessageFlags {
 interface DbShape {
   users: User[];
   domains: Domain[];
+  receiveChannels: ReceiveChannel[];
   sessions: Session[];
   auditLogs: AuditLog[];
   mailAccounts: MailAccount[];
@@ -149,6 +193,7 @@ interface DbShape {
   messageFlags: Record<string, MessageFlags>;
   settings: {
     feishu: FeishuSettings;
+    smtp: SmtpSettings;
     /** Legacy / env-seeded global API keys (dk_…) — still accepted */
     apiKeys: string[];
   };
@@ -210,11 +255,96 @@ function defaultFeishu(): FeishuSettings {
   };
 }
 
+function defaultSmtp(): SmtpSettings {
+  return {
+    enabled: false,
+    host: "",
+    port: 587,
+    secure: false,
+    username: "",
+    password: "",
+    fromAddress: "",
+    fromName: "Touch Mail",
+    replyTo: "",
+    updatedAt: null,
+    updatedBy: null,
+  };
+}
+
+function isValidWorkerName(value: string): boolean {
+  return (
+    value.length >= 1 &&
+    value.length <= 63 &&
+    /^[a-z0-9-]+$/.test(value) &&
+    !value.startsWith("-") &&
+    !value.endsWith("-")
+  );
+}
+
+function publicReceiveChannel(channel: ReceiveChannel): PublicReceiveChannel {
+  return {
+    ...channel,
+    adminKey: channel.adminKey ? "••••••••" : "",
+    pushToken: channel.pushToken ? `${channel.pushToken.slice(0, 8)}…${channel.pushToken.slice(-4)}` : "",
+    adminKeySet: Boolean(channel.adminKey),
+    pushTokenSet: Boolean(channel.pushToken),
+  };
+}
+
+function normalizeReceiveChannel(channel: ReceiveChannel): ReceiveChannel {
+  channel.name = channel.name.trim().slice(0, 80);
+  channel.description = channel.description.trim().slice(0, 300);
+  channel.forwardingAddressTemplate = channel.forwardingAddressTemplate.trim().toLowerCase();
+  channel.baseUrl = channel.baseUrl.trim().replace(/\/$/, "");
+  channel.adminKey = channel.adminKey.trim();
+  channel.pushToken = channel.pushToken.trim();
+  channel.pollIntervalSeconds = Math.min(3600, Math.max(30, channel.pollIntervalSeconds || 60));
+  if (!channel.name) throw new Error("请填写收件渠道名称");
+  if (channel.type === "worker") {
+    channel.forwardingAddressTemplate = "";
+    channel.baseUrl = "";
+    channel.adminKey = "";
+    channel.pushToken = "";
+  } else if (channel.type === "email_forward") {
+    if (!channel.forwardingAddressTemplate.includes("{tenant}")) {
+      throw new Error("邮箱转发目标模板必须包含 {tenant}");
+    }
+    if (!channel.forwardingAddressTemplate.includes("@")) {
+      throw new Error("邮箱转发目标模板格式不正确");
+    }
+    if (channel.pushToken.length < 16) throw new Error("邮箱转发渠道 Token 至少 16 位");
+    channel.baseUrl = "";
+    channel.adminKey = "";
+  } else if (channel.type === "donemail") {
+    let url: URL;
+    try {
+      url = new URL(channel.baseUrl);
+    } catch {
+      throw new Error("DoneMail API 地址格式不正确");
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      throw new Error("DoneMail API 地址必须使用 HTTP 或 HTTPS");
+    }
+    if (!channel.adminKey) throw new Error("请填写 DoneMail X-Admin-Key");
+    channel.forwardingAddressTemplate = "";
+    channel.pushToken = "";
+  } else if (channel.type === "api_push") {
+    if (channel.pushToken.length < 16) throw new Error("API 上报 Token 至少 16 位");
+    channel.forwardingAddressTemplate = "";
+    channel.baseUrl = "";
+    channel.adminKey = "";
+  } else {
+    throw new Error("不支持的收件渠道类型");
+  }
+  return channel;
+}
+
 export class AppDb {
   private file: string;
   private data: DbShape = {
     users: [],
     domains: [],
+    receiveChannels: [],
     sessions: [],
     auditLogs: [],
     mailAccounts: [],
@@ -222,7 +352,7 @@ export class AppDb {
     userApiKeys: [],
     apiCallLogs: [],
     messageFlags: {},
-    settings: { feishu: defaultFeishu(), apiKeys: [] },
+    settings: { feishu: defaultFeishu(), smtp: defaultSmtp(), apiKeys: [] },
   };
   private writeChain: Promise<void> = Promise.resolve();
 
@@ -238,11 +368,12 @@ export class AppDb {
     try {
       const raw = await readFile(this.file, "utf8");
       const parsed = JSON.parse(raw) as Partial<DbShape> & {
-        settings?: { feishu?: FeishuSettings; apiKeys?: string[] };
+        settings?: { feishu?: FeishuSettings; smtp?: SmtpSettings; apiKeys?: string[] };
       };
       this.data = {
         users: parsed.users || [],
         domains: parsed.domains || [],
+        receiveChannels: parsed.receiveChannels || [],
         sessions: parsed.sessions || [],
         auditLogs: parsed.auditLogs || [],
         mailAccounts: parsed.mailAccounts || [],
@@ -252,24 +383,42 @@ export class AppDb {
         messageFlags: parsed.messageFlags || {},
         settings: {
           feishu: { ...defaultFeishu(), ...(parsed.settings?.feishu || {}) },
+          smtp: { ...defaultSmtp(), ...(parsed.settings?.smtp || {}) },
           apiKeys: parsed.settings?.apiKeys || [],
         },
       };
-      // migrate legacy users without role/status
+      let migrated = false;
       for (const u of this.data.users) {
         if (!u.role) u.role = "user";
         if (!u.status) u.status = "active";
         if (!u.updatedAt) u.updatedAt = u.createdAt;
       }
-      // migrate domains: default private (safer) if visibility missing
-      let migrated = false;
       for (const d of this.data.domains) {
         if (d.visibility !== "public" && d.visibility !== "private") {
           d.visibility = "private";
           migrated = true;
         }
+        if ((d as Partial<Domain>).receiveChannelId === undefined) {
+          d.receiveChannelId = null;
+          migrated = true;
+        }
+        if ((d as Partial<Domain>).workerName === undefined) {
+          d.workerName = "";
+          migrated = true;
+        }
       }
-      // migrate API keys: scopes + status
+      for (const channel of this.data.receiveChannels) {
+        channel.description ||= "";
+        channel.forwardingAddressTemplate ||= "";
+        channel.baseUrl ||= "";
+        channel.adminKey ||= "";
+        channel.pushToken ||= "";
+        channel.pollIntervalSeconds = Math.min(3600, Math.max(30, channel.pollIntervalSeconds || 60));
+        channel.lastSyncAt ||= null;
+        channel.lastSyncError ||= "";
+        channel.updatedAt ||= channel.createdAt;
+        channel.updatedBy ||= "system";
+      }
       for (const k of this.data.userApiKeys) {
         if (!Array.isArray(k.scopes) || k.scopes.length === 0) {
           k.scopes = ["read", "write"];
@@ -283,13 +432,16 @@ export class AppDb {
           migrated = true;
         }
       }
-      // first user becomes admin if none
       if (this.data.users.length && !this.data.users.some((u) => u.role === "admin")) {
         this.data.users[0].role = "admin";
       }
       if (migrated) await this.persist();
-    } catch {
-      await this.persist();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        await this.persist();
+      } else {
+        throw error;
+      }
     }
     this.purgeExpiredSessions();
   }
@@ -590,8 +742,10 @@ export class AppDb {
   async addDomain(
     userId: string,
     domainRaw: string,
-    note = "",
-    visibility: DomainVisibility = "private",
+    note: string,
+    visibility: DomainVisibility,
+    receiveChannelId: string,
+    workerName: string,
   ): Promise<Domain> {
     const domain = domainRaw
       .trim()
@@ -602,16 +756,26 @@ export class AppDb {
     if (!/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/.test(domain)) {
       throw new Error("域名格式不正确");
     }
-    const exists = this.data.domains.find((d) => d.userId === userId && d.domain === domain);
-    if (exists) throw new Error("该域名已添加");
-    const vis: DomainVisibility = visibility === "public" ? "public" : "private";
+    if (this.data.domains.some((d) => d.domain === domain)) {
+      throw new Error("该域名已被绑定");
+    }
+    const receiveChannel = this.getReceiveChannel(receiveChannelId);
+    if (!receiveChannel || !receiveChannel.enabled) {
+      throw new Error("请选择管理员已启用的收件渠道");
+    }
+    const normalizedWorkerName = workerName.trim().toLowerCase();
+    if (receiveChannel.type === "worker" && !isValidWorkerName(normalizedWorkerName)) {
+      throw new Error("Worker Name 只能包含小写字母、数字和连字符，最长 63 位，且不能以连字符开头或结尾");
+    }
 
     const item: Domain = {
       id: id("d"),
       userId,
       domain,
       note: note.slice(0, 200),
-      visibility: vis,
+      visibility: visibility === "public" ? "public" : "private",
+      receiveChannelId: receiveChannel.id,
+      workerName: receiveChannel.type === "worker" ? normalizedWorkerName : "",
       createdAt: new Date().toISOString(),
     };
     this.data.domains.push(item);
@@ -622,7 +786,12 @@ export class AppDb {
   async updateDomain(
     userId: string,
     domainId: string,
-    patch: Partial<{ note: string; visibility: DomainVisibility }>,
+    patch: Partial<{
+      note: string;
+      visibility: DomainVisibility;
+      receiveChannelId: string;
+      workerName: string;
+    }>,
   ): Promise<Domain | null> {
     const item = this.data.domains.find((d) => d.userId === userId && d.id === domainId);
     if (!item) return null;
@@ -630,8 +799,221 @@ export class AppDb {
     if (patch.visibility === "public" || patch.visibility === "private") {
       item.visibility = patch.visibility;
     }
+    const receiveChannelId = patch.receiveChannelId ?? item.receiveChannelId;
+    if (receiveChannelId) {
+      const receiveChannel = this.getReceiveChannel(receiveChannelId);
+      if (!receiveChannel || (!receiveChannel.enabled && receiveChannel.id !== item.receiveChannelId)) {
+        throw new Error("请选择管理员已启用的收件渠道");
+      }
+      const workerName = String(patch.workerName ?? item.workerName).trim().toLowerCase();
+      if (receiveChannel.type === "worker" && !isValidWorkerName(workerName)) {
+        throw new Error("Worker Name 只能包含小写字母、数字和连字符，最长 63 位，且不能以连字符开头或结尾");
+      }
+      item.receiveChannelId = receiveChannel.id;
+      item.workerName = receiveChannel.type === "worker" ? workerName : "";
+    }
     await this.queueWrite();
     return item;
+  }
+
+
+  listReceiveChannels(includeDisabled = false): ReceiveChannel[] {
+    return this.data.receiveChannels
+      .filter((channel) => includeDisabled || channel.enabled)
+      .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+      .map((channel) => ({ ...channel }));
+  }
+
+  listReceiveChannelsPublic(includeDisabled = false): PublicReceiveChannel[] {
+    return this.listReceiveChannels(includeDisabled).map(publicReceiveChannel);
+  }
+
+  getReceiveChannel(channelId: string | null | undefined): ReceiveChannel | undefined {
+    if (!channelId) return undefined;
+    return this.data.receiveChannels.find((channel) => channel.id === channelId);
+  }
+
+  getReceiveChannelPublic(channelId: string | null | undefined): PublicReceiveChannel | undefined {
+    const channel = this.getReceiveChannel(channelId);
+    return channel ? publicReceiveChannel(channel) : undefined;
+  }
+
+  async createReceiveChannel(
+    input: {
+      name: string;
+      description?: string;
+      type: ReceiveChannelType;
+      enabled?: boolean;
+      forwardingAddressTemplate?: string;
+      baseUrl?: string;
+      adminKey?: string;
+      pushToken?: string;
+      pollIntervalSeconds?: number;
+    },
+    updatedBy: string,
+  ): Promise<ReceiveChannel> {
+    const now = new Date().toISOString();
+    const channel = normalizeReceiveChannel({
+      id: id("rc_"),
+      name: String(input.name || ""),
+      description: String(input.description || ""),
+      type: input.type,
+      enabled: input.enabled ?? true,
+      forwardingAddressTemplate: String(input.forwardingAddressTemplate || ""),
+      baseUrl: String(input.baseUrl || ""),
+      adminKey: String(input.adminKey || ""),
+      pushToken:
+        input.type === "api_push" || input.type === "email_forward"
+          ? String(input.pushToken || `tm_in_${randomBytes(24).toString("base64url")}`)
+          : "",
+      pollIntervalSeconds: Number(input.pollIntervalSeconds || 60),
+      lastSyncAt: null,
+      lastSyncError: "",
+      createdAt: now,
+      updatedAt: now,
+      updatedBy,
+    });
+    if (this.data.receiveChannels.some((item) => item.name === channel.name)) {
+      throw new Error("收件渠道名称已存在");
+    }
+    this.data.receiveChannels.push(channel);
+    await this.queueWrite();
+    return { ...channel };
+  }
+
+  async updateReceiveChannel(
+    channelId: string,
+    patch: Partial<{
+      name: string;
+      description: string;
+      type: ReceiveChannelType;
+      enabled: boolean;
+      forwardingAddressTemplate: string;
+      baseUrl: string;
+      adminKey: string;
+      pushToken: string;
+      pollIntervalSeconds: number;
+    }>,
+    updatedBy: string,
+  ): Promise<ReceiveChannel | null> {
+    const current = this.getReceiveChannel(channelId);
+    if (!current) return null;
+    const next = normalizeReceiveChannel({
+      ...current,
+      name: patch.name !== undefined ? String(patch.name) : current.name,
+      description:
+        patch.description !== undefined ? String(patch.description) : current.description,
+      type: patch.type || current.type,
+      enabled: patch.enabled ?? current.enabled,
+      forwardingAddressTemplate:
+        patch.forwardingAddressTemplate !== undefined
+          ? String(patch.forwardingAddressTemplate)
+          : current.forwardingAddressTemplate,
+      baseUrl: patch.baseUrl !== undefined ? String(patch.baseUrl) : current.baseUrl,
+      adminKey:
+        patch.adminKey !== undefined && patch.adminKey && !String(patch.adminKey).includes("••")
+          ? String(patch.adminKey)
+          : current.adminKey,
+      pushToken:
+        patch.pushToken !== undefined && patch.pushToken && !String(patch.pushToken).includes("…")
+          ? String(patch.pushToken)
+          : current.pushToken,
+      pollIntervalSeconds:
+        patch.pollIntervalSeconds !== undefined
+          ? Number(patch.pollIntervalSeconds)
+          : current.pollIntervalSeconds,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
+    });
+    if (this.data.receiveChannels.some((item) => item.id !== channelId && item.name === next.name)) {
+      throw new Error("收件渠道名称已存在");
+    }
+    Object.assign(current, next);
+    await this.queueWrite();
+    return { ...current };
+  }
+
+  async deleteReceiveChannel(channelId: string): Promise<boolean> {
+    if (this.data.domains.some((domain) => domain.receiveChannelId === channelId)) {
+      throw new Error("该收件渠道仍被域名使用，不能删除");
+    }
+    const before = this.data.receiveChannels.length;
+    this.data.receiveChannels = this.data.receiveChannels.filter((channel) => channel.id !== channelId);
+    if (this.data.receiveChannels.length === before) return false;
+    await this.queueWrite();
+    return true;
+  }
+
+  async markReceiveChannelSync(channelId: string, error = ""): Promise<void> {
+    const channel = this.getReceiveChannel(channelId);
+    if (!channel) return;
+    channel.lastSyncAt = new Date().toISOString();
+    channel.lastSyncError = error.slice(0, 500);
+    await this.queueWrite();
+  }
+
+  findDomainByName(domainName: string): Domain | undefined {
+    const normalized = domainName.trim().toLowerCase().replace(/\.$/, "");
+    return this.data.domains.find((domain) => domain.domain === normalized);
+  }
+
+  findDomainByAddress(address: string): Domain | undefined {
+    const at = address.lastIndexOf("@");
+    return at > 0 ? this.findDomainByName(address.slice(at + 1)) : undefined;
+  }
+
+  renderForwardingAddress(domain: Domain, tenant: string): string | null {
+    const channel = this.getReceiveChannel(domain.receiveChannelId);
+    if (!channel || channel.type !== "email_forward") return null;
+    return channel.forwardingAddressTemplate
+      .replaceAll("{tenant}", tenant.toLowerCase())
+      .replaceAll("{domain}", domain.domain);
+  }
+
+  getSmtpSettings(): SmtpSettings {
+    return { ...this.data.settings.smtp };
+  }
+
+  getSmtpSettingsPublic(): SmtpSettings & { passwordSet: boolean } {
+    const smtp = this.data.settings.smtp;
+    return {
+      ...smtp,
+      password: smtp.password ? "••••••••" : "",
+      passwordSet: Boolean(smtp.password),
+    };
+  }
+
+  async updateSmtpSettings(
+    patch: Partial<Omit<SmtpSettings, "updatedAt" | "updatedBy">>,
+    updatedBy: string,
+  ): Promise<SmtpSettings> {
+    const current = this.data.settings.smtp;
+    const next: SmtpSettings = {
+      ...current,
+      enabled: patch.enabled ?? current.enabled,
+      host: patch.host !== undefined ? String(patch.host).trim() : current.host,
+      port:
+        patch.port !== undefined
+          ? Math.min(65535, Math.max(1, Number(patch.port)))
+          : current.port,
+      secure: patch.secure ?? current.secure,
+      username: patch.username !== undefined ? String(patch.username).trim() : current.username,
+      fromAddress:
+        patch.fromAddress !== undefined
+          ? String(patch.fromAddress).trim().toLowerCase()
+          : current.fromAddress,
+      fromName: patch.fromName !== undefined ? String(patch.fromName).trim() : current.fromName,
+      replyTo:
+        patch.replyTo !== undefined ? String(patch.replyTo).trim().toLowerCase() : current.replyTo,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
+    };
+    if (patch.password !== undefined && patch.password && !String(patch.password).includes("••")) {
+      next.password = String(patch.password);
+    }
+    this.data.settings.smtp = next;
+    await this.queueWrite();
+    return { ...next };
   }
 
   async removeDomain(userId: string, domainId: string): Promise<boolean> {
@@ -749,7 +1131,15 @@ export class AppDb {
   }): Promise<{ meta: MailMeta; duplicate: boolean }> {
     const receivedAt = new Date().toISOString();
     const mid = createHash("sha256")
-      .update([opts.tenant, opts.messageId || "", opts.from, opts.to, String(opts.raw.length), receivedAt].join("|"))
+      .update([
+        opts.tenant,
+        opts.messageId || "",
+        opts.from,
+        opts.to,
+        String(opts.raw.length),
+        receivedAt,
+        randomBytes(8).toString("hex"),
+      ].join("|"))
       .digest("hex")
       .slice(0, 24);
 
@@ -816,7 +1206,25 @@ export class AppDb {
 
     if (opts.messageId) {
       const key = createHash("sha256").update(`${opts.tenant}|${opts.messageId}`).digest("hex");
-      await writeFile(path.join(this.dataDir, "index", `${key}.id`), mid, "utf8");
+      const indexPath = path.join(this.dataDir, "index", `${key}.id`);
+      try {
+        await writeFile(indexPath, mid, { encoding: "utf8", flag: "wx" });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        await Promise.all([
+          unlink(rawPath).catch(() => undefined),
+          unlink(jsonPath).catch(() => undefined),
+        ]);
+        return {
+          meta: {
+            ...meta,
+            id: `dup-${mid}`,
+            rawPath: "",
+            jsonPath: "",
+          },
+          duplicate: true,
+        };
+      }
     }
 
     const timeline = path.join(this.dataDir, "meta", safe, "timeline.ndjson");

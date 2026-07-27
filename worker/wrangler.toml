@@ -1,6 +1,6 @@
 name = "touch-mail-router"
 main = "src/index.ts"
-compatibility_date = "2026-06-25"
+compatibility_date = "2026-07-26"
 workers_dev = true
 
 # 非密钥配置。密钥用 wrangler secret put：
@@ -9,8 +9,10 @@ workers_dev = true
 [vars]
 # 你的云端入站接口（HTTPS）
 WEBHOOK_URL = "https://mail-api.example.com/v1/inbound"
-# 入站域名，用于校验 message.to（可逗号分隔多个）
-INBOUND_DOMAINS = "inbound.example.com"
+# 该 Worker 对应的单个客户域名；Email Routing 动作选择 Send to a Worker
+EMAIL_DOMAIN = "customer.example.com"
+# 邮箱转发渠道填写后台生成的 rc_...；每域直连 Worker 可留空
+RECEIVE_CHANNEL_ID = ""
 # 签名时间窗（秒）
 SIGNATURE_SKEW_SECONDS = "300"
 # 推送失败时是否 reject（永久拒收）。false 时抛错让平台重试

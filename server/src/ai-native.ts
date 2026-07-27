@@ -106,11 +106,13 @@ export function buildOpenApi(config: AppConfig) {
               "application/json": {
                 schema: {
                   type: "object",
-                  required: ["domain"],
+                  required: ["domain", "receiveChannelId"],
                   properties: {
                     domain: { type: "string" },
                     note: { type: "string" },
                     visibility: { type: "string", enum: ["public", "private"] },
+                    receiveChannelId: { type: "string" },
+                    workerName: { type: "string" },
                   },
                 },
               },
@@ -229,8 +231,8 @@ export function buildSkillManifest(config: AppConfig) {
       "Prefer /ai/v1/* for structured ok/error envelopes.",
       "Always send Authorization: Bearer dk_… from the user personal API keys page.",
       "write scope required for POST/PATCH/DELETE; read is enough for GET.",
-      "Inbound mail path: customer mailbox → forward to {tenant}@{inboundDomain} → Worker → POST /v1/inbound.",
-      "Domain registration in this API is ledger only; Worker + email forward still required.",
+      "Each domain must bind one administrator-enabled receive channel.",
+      "Worker channels use Cloudflare Email Routing → Send to a Worker; email forwarding is a separate channel type.",
       "For temporary mailboxes use DuckMail-compatible /accounts + /token + /messages.",
       "After each call, history is recorded under /ai/v1/history for the key owner.",
     ],
@@ -364,7 +366,6 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
           tenant: u.tenant,
           displayName: u.displayName,
           role: u.role,
-          inboundAddress: `${u.tenant}@${config.INBOUND_DOMAIN}`,
         },
         scopes: ai.scopes,
         key: { id: ai.keyId, name: ai.keyName, global: ai.global },
@@ -374,15 +375,19 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
 
   app.get("/ai/v1/inbound", requireScope("read"), async (c) =>
     withHistory(c, async () => {
-      const ai = c.get("ai");
       return ok(c, {
-        inboundAddress: `${ai.user.tenant}@${config.INBOUND_DOMAIN}`,
-        inboundDomain: config.INBOUND_DOMAIN,
-        webhookUrl: `${config.PUBLIC_URL.replace(/\/$/, "")}/v1/inbound`,
+        receiveChannels: db.listReceiveChannelsPublic(false).map((channel) => ({
+          ...channel,
+          adminKey: "",
+          pushToken: "",
+          adminKeySet: false,
+          pushTokenSet: false,
+        })),
+        workerWebhookUrl: `${config.PUBLIC_URL.replace(/\/$/, "")}/v1/inbound`,
         notes: [
-          "Customer mailbox must forward to inboundAddress.",
-          "Cloudflare Email Routing Catch-all on inboundDomain must hit the Email Worker.",
-          "Worker POSTs raw RFC822 to webhookUrl with HMAC headers.",
+          "Bind every domain to one enabled receive channel.",
+          "Worker: configure Cloudflare Email Routing action Send to a Worker; no email forwarding is required.",
+          "Email forward, DoneMail pull, and generic API push are separate channel types.",
         ],
       });
     }),
@@ -427,6 +432,8 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
           String(body.domain || ""),
           String(body.note || ""),
           visibility,
+          String(body.receiveChannelId || ""),
+          String(body.workerName || ""),
         );
         await db.addAudit({
           actorId: ai.user.id,

@@ -8,6 +8,7 @@ data/
 .DS_Store
 *.log
 .wrangler/
+.serena/
 .dev.vars
 server/data/
 server/data-test/

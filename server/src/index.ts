@@ -6,14 +6,30 @@ import { bodyLimit } from "hono/body-limit";
 import { logger } from "hono/logger";
 import { cors } from "hono/cors";
 import path from "node:path";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.js";
-import { verifySignature } from "./crypto.js";
+import { deriveDomainWebhookSecret, verifySignature } from "./crypto.js";
 import { AppDb, verifyPassword, type ApiKeyScope, type User, type UserRole } from "./db.js";
 import { createAiNativeApp } from "./ai-native.js";
 import { createDuckMailApp } from "./duckmail.js";
+import {
+  FeishuTestError,
+  listFeishuChats,
+  sendFeishuNotification,
+  testFeishuConnection,
+} from "./feishu.js";
 import { parseRawEmail } from "./parse.js";
 import { buildWorkerSnippet } from "./worker-snippet.js";
+import {
+  ingestApiMail,
+  resolveLegacyInboundRecipient,
+  startDoneMailScheduler,
+  syncDoneMailChannel,
+  testDoneMailConnection,
+  type InboundMailNotifier,
+} from "./inbound-adapters.js";
+import { sendSmtpMail, verifySmtpSettings } from "./smtp.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "..", "public");
@@ -32,6 +48,48 @@ if (config.API_KEYS) {
     }
   }
 }
+
+const notifyInboundMail: InboundMailNotifier = async (mail) => {
+  const feishu = db.getFeishuSettings();
+  if (
+    !feishu.enabled ||
+    !feishu.notifyOnInbound ||
+    !feishu.appId ||
+    !feishu.appSecret ||
+    !feishu.notifyChatId
+  ) {
+    return;
+  }
+  const text = [
+    "TouchMail 收到新邮件",
+    `主题：${mail.subject || "（无主题）"}`,
+    `发件人：${mail.from || "未知"}`,
+    `收件人：${mail.to || "未知"}`,
+    `租户：${mail.tenant}`,
+    `渠道：${mail.channel}`,
+    `查看：${config.PUBLIC_URL.replace(/\/$/, "")}/mails`,
+  ].join("\n");
+  try {
+    await sendFeishuNotification(
+      {
+        appId: feishu.appId,
+        appSecret: feishu.appSecret,
+        notifyChatId: feishu.notifyChatId,
+      },
+      text,
+    );
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "feishu.inbound_notification_failed",
+        mailId: mail.id,
+        error: error instanceof Error ? error.message : "unknown error",
+      }),
+    );
+  }
+};
+
+startDoneMailScheduler(db, config.MAX_BODY_BYTES, notifyInboundMail);
 
 type Vars = { user: User };
 
@@ -103,7 +161,6 @@ function publicUser(u: User) {
     status: u.status,
     createdAt: u.createdAt,
     updatedAt: u.updatedAt,
-    inboundAddress: `${u.tenant}@${config.INBOUND_DOMAIN}`,
   };
 }
 
@@ -262,8 +319,6 @@ app.get("/api/dashboard", requireUser, async (c) => {
   const global = user.role === "admin" ? db.globalStats() : null;
   return c.json({
     user: publicUser(user),
-    inboundAddress: `${user.tenant}@${config.INBOUND_DOMAIN}`,
-    inboundDomain: config.INBOUND_DOMAIN,
     domainCount: domains.length,
     mailCount: mailPage.total,
     lastMailAt: mailPage.items[0]?.receivedAt || null,
@@ -273,7 +328,19 @@ app.get("/api/dashboard", requireUser, async (c) => {
   });
 });
 
-// ---------- domains (tenant) ----------
+// ---------- receive channels + domains (tenant) ----------
+app.get("/api/receive-channels", requireUser, (c) => {
+  return c.json({
+    items: db.listReceiveChannelsPublic(false).map((channel) => ({
+      ...channel,
+      adminKey: "",
+      pushToken: "",
+      adminKeySet: false,
+      pushTokenSet: false,
+    })),
+  });
+});
+
 app.get("/api/domains", requireUser, (c) => {
   const user = c.get("user");
   const { q, page, pageSize } = pageParams(c);
@@ -307,6 +374,8 @@ app.post("/api/domains", requireUser, async (c) => {
       String(body.domain || ""),
       String(body.note || ""),
       visibility,
+      String(body.receiveChannelId || ""),
+      String(body.workerName || ""),
     );
     await db.addAudit({
       actorId: user.id,
@@ -333,6 +402,9 @@ app.patch("/api/domains/:id", requireUser, async (c) => {
       body.visibility === "public" || body.visibility === "private"
         ? body.visibility
         : undefined,
+    receiveChannelId:
+      body.receiveChannelId !== undefined ? String(body.receiveChannelId) : undefined,
+    workerName: body.workerName !== undefined ? String(body.workerName) : undefined,
   });
   if (!domain) return c.json({ error: "未找到域名" }, 404);
   await db.addAudit({
@@ -361,6 +433,86 @@ app.delete("/api/domains/:id", requireUser, async (c) => {
     ip: clientIp(c),
   });
   return c.json({ ok: true });
+});
+
+// ---------- SMTP status, outbound mail, and domain test ----------
+app.get("/api/smtp/status", requireUser, (c) => {
+  const smtp = db.getSmtpSettingsPublic();
+  return c.json({
+    enabled: smtp.enabled,
+    fromAddress: smtp.fromAddress,
+    fromName: smtp.fromName,
+  });
+});
+
+app.post("/api/outbound", requireAdmin, async (c) => {
+  const user = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  const to = String(body.to || "").trim();
+  const subject = String(body.subject || "").trim().slice(0, 300);
+  const text = String(body.text || "");
+  const html = body.html !== undefined ? String(body.html) : undefined;
+  if (!to.includes("@")) return c.json({ error: "收件邮箱格式不正确" }, 400);
+  if (!subject) return c.json({ error: "请填写邮件主题" }, 400);
+  if (!text && !html) return c.json({ error: "请填写邮件正文" }, 400);
+  try {
+    const result = await sendSmtpMail(db.getSmtpSettings(), { to, subject, text, html });
+    await db.addAudit({
+      actorId: user.id,
+      actorUsername: user.username,
+      action: "send",
+      resource: "outbound_mail",
+      resourceId: result.messageId,
+      detail: `to=${to} subject=${subject.slice(0, 80)}`,
+      ip: clientIp(c),
+    });
+    return c.json({ ok: true, ...result }, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "邮件发送失败" }, 502);
+  }
+});
+
+app.post("/api/domains/:id/test", requireAdmin, async (c) => {
+  const user = c.get("user");
+  const domain = db.listDomains(user.id).find((item) => item.id === c.req.param("id"));
+  if (!domain) return c.json({ error: "未找到域名" }, 404);
+  const body = await c.req.json().catch(() => ({}));
+  const recipient = String(body.recipient || `test@${domain.domain}`).trim().toLowerCase();
+  if (db.findDomainByAddress(recipient)?.id !== domain.id) {
+    return c.json({ error: `测试收件地址必须属于 ${domain.domain}` }, 400);
+  }
+  const token = randomBytes(6).toString("hex");
+  const subject = `Touch Mail 域名接入测试 [${token}]`;
+  try {
+    const result = await sendSmtpMail(db.getSmtpSettings(), {
+      to: recipient,
+      subject,
+      text: `这是一封 Touch Mail 自动接入测试邮件。\n域名：${domain.domain}\n测试标识：${token}\n如果后台自动显示接收成功，说明收件渠道已经接通。`,
+      headers: { "X-Touch-Mail-Domain-Test": token },
+    });
+    await db.addAudit({
+      actorId: user.id,
+      actorUsername: user.username,
+      action: "test",
+      resource: "domain_inbound",
+      resourceId: domain.id,
+      detail: `recipient=${recipient} token=${token}`,
+      ip: clientIp(c),
+    });
+    return c.json({ ok: true, token, recipient, messageId: result.messageId }, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "测试邮件发送失败" }, 502);
+  }
+});
+
+app.get("/api/domains/:id/test/:token", requireUser, async (c) => {
+  const user = c.get("user");
+  const domain = db.listDomains(user.id).find((item) => item.id === c.req.param("id"));
+  if (!domain) return c.json({ error: "未找到域名" }, 404);
+  const token = c.req.param("token") || "";
+  if (!/^[a-f0-9]{12}$/.test(token)) return c.json({ error: "测试标识无效" }, 400);
+  const result = await db.listMails(user.tenant, { q: token, pageSize: 1 });
+  return c.json({ received: result.total > 0, mail: result.items[0] || null });
 });
 
 // ---------- personal: API keys + call history + docs ----------
@@ -529,21 +681,180 @@ app.get("/api/mails/:id", requireUser, async (c) => {
 });
 
 // ---------- worker snippet ----------
-app.get("/api/worker-snippet", requireUser, (c) => {
+app.get("/api/domains/:id/worker-snippet", requireUser, (c) => {
   const user = c.get("user");
+  const domain = db.listDomains(user.id).find((item) => item.id === c.req.param("id"));
+  if (!domain) return c.json({ error: "未找到域名" }, 404);
+  const channel = db.getReceiveChannel(domain.receiveChannelId);
+  if (!channel || channel.type !== "worker") {
+    return c.json({ error: "该域名未选择 Cloudflare Worker 渠道" }, 400);
+  }
+  if (!domain.workerName) return c.json({ error: "请先配置 Worker Name" }, 400);
   const webhookUrl = `${config.PUBLIC_URL.replace(/\/$/, "")}/v1/inbound`;
+  const webhookSecret = deriveDomainWebhookSecret(config.WEBHOOK_SECRET, domain.id);
   const snippet = buildWorkerSnippet({
     webhookUrl,
-    webhookSecret: config.WEBHOOK_SECRET,
-    inboundDomain: config.INBOUND_DOMAIN,
-    tenant: user.tenant,
+    webhookSecret,
+    domain: domain.domain,
+    workerName: domain.workerName,
   });
   return c.json({
-    tenant: user.tenant,
-    inboundAddress: `${user.tenant}@${config.INBOUND_DOMAIN}`,
+    domainId: domain.id,
+    domain: domain.domain,
+    workerName: domain.workerName,
     webhookUrl,
+    webhookSecret,
     ...snippet,
   });
+});
+
+// ---------- admin: receive channels ----------
+app.get("/api/admin/receive-channels", requireAdmin, (c) => {
+  return c.json({ items: db.listReceiveChannelsPublic(true) });
+});
+
+app.post("/api/admin/receive-channels", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  const type = ["worker", "email_forward", "donemail", "api_push"].includes(body.type)
+    ? body.type
+    : "";
+  try {
+    const channel = await db.createReceiveChannel(
+      {
+        name: String(body.name || ""),
+        description: String(body.description || ""),
+        type,
+        enabled: body.enabled !== false,
+        forwardingAddressTemplate: String(body.forwardingAddressTemplate || ""),
+        baseUrl: String(body.baseUrl || ""),
+        adminKey: String(body.adminKey || ""),
+        pushToken: String(body.pushToken || ""),
+        pollIntervalSeconds: Number(body.pollIntervalSeconds || 60),
+      },
+      actor.username,
+    );
+    await db.addAudit({
+      actorId: actor.id,
+      actorUsername: actor.username,
+      action: "create",
+      resource: "receive_channel",
+      resourceId: channel.id,
+      detail: `${channel.name} type=${channel.type}`,
+      ip: clientIp(c),
+    });
+    return c.json(
+      {
+        ok: true,
+        channel: db.getReceiveChannelPublic(channel.id),
+        pushToken:
+          channel.type === "api_push" || channel.type === "email_forward"
+            ? channel.pushToken
+            : undefined,
+      },
+      201,
+    );
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "创建失败" }, 400);
+  }
+});
+
+app.patch("/api/admin/receive-channels/:id", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  try {
+    const channel = await db.updateReceiveChannel(
+      c.req.param("id") || "",
+      {
+        name: body.name !== undefined ? String(body.name) : undefined,
+        description: body.description !== undefined ? String(body.description) : undefined,
+        type: ["worker", "email_forward", "donemail", "api_push"].includes(body.type)
+          ? body.type
+          : undefined,
+        enabled: body.enabled !== undefined ? Boolean(body.enabled) : undefined,
+        forwardingAddressTemplate:
+          body.forwardingAddressTemplate !== undefined
+            ? String(body.forwardingAddressTemplate)
+            : undefined,
+        baseUrl: body.baseUrl !== undefined ? String(body.baseUrl) : undefined,
+        adminKey: body.adminKey !== undefined ? String(body.adminKey) : undefined,
+        pushToken: body.pushToken !== undefined ? String(body.pushToken) : undefined,
+        pollIntervalSeconds:
+          body.pollIntervalSeconds !== undefined ? Number(body.pollIntervalSeconds) : undefined,
+      },
+      actor.username,
+    );
+    if (!channel) return c.json({ error: "未找到收件渠道" }, 404);
+    await db.addAudit({
+      actorId: actor.id,
+      actorUsername: actor.username,
+      action: "update",
+      resource: "receive_channel",
+      resourceId: channel.id,
+      detail: `${channel.name} enabled=${channel.enabled}`,
+      ip: clientIp(c),
+    });
+    return c.json({ ok: true, channel: db.getReceiveChannelPublic(channel.id) });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "更新失败" }, 400);
+  }
+});
+
+app.delete("/api/admin/receive-channels/:id", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const channelId = c.req.param("id") || "";
+  try {
+    const deleted = await db.deleteReceiveChannel(channelId);
+    if (!deleted) return c.json({ error: "未找到收件渠道" }, 404);
+    await db.addAudit({
+      actorId: actor.id,
+      actorUsername: actor.username,
+      action: "delete",
+      resource: "receive_channel",
+      resourceId: channelId,
+      ip: clientIp(c),
+    });
+    return c.json({ ok: true });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "删除失败" }, 400);
+  }
+});
+
+app.post("/api/admin/receive-channels/:id/test", requireAdmin, async (c) => {
+  const channel = db.getReceiveChannel(c.req.param("id"));
+  if (!channel) return c.json({ error: "未找到收件渠道" }, 404);
+  try {
+    const result =
+      channel.type === "donemail"
+        ? await testDoneMailConnection(channel)
+        : {
+            ready: true,
+            endpoint:
+              channel.type === "api_push"
+                ? `${config.PUBLIC_URL.replace(/\/$/, "")}/v1/inbound/json/${channel.id}`
+                : undefined,
+          };
+    return c.json({ ok: true, result });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "渠道测试失败" }, 502);
+  }
+});
+
+app.post("/api/admin/receive-channels/:id/sync", requireAdmin, async (c) => {
+  const channel = db.getReceiveChannel(c.req.param("id"));
+  if (!channel) return c.json({ error: "未找到收件渠道" }, 404);
+  try {
+    const result = await syncDoneMailChannel(
+      db,
+      channel,
+      config.MAX_BODY_BYTES,
+      undefined,
+      notifyInboundMail,
+    );
+    return c.json({ ok: true, result });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "同步失败" }, 502);
+  }
 });
 
 // ---------- admin: users ----------
@@ -714,6 +1025,166 @@ app.put("/api/admin/settings/feishu", requireAdmin, async (c) => {
   return c.json({ ok: true, settings: db.getFeishuSettingsPublic() });
 });
 
+app.post("/api/admin/settings/feishu/test", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  const saved = db.getFeishuSettings();
+  const submittedSecret = body.appSecret !== undefined ? String(body.appSecret).trim() : "";
+  const secretSource =
+    submittedSecret && !submittedSecret.includes("••")
+      ? "current_input"
+      : saved.appSecret
+        ? "saved"
+        : "missing";
+
+  try {
+    const result = await testFeishuConnection({
+      appId: body.appId !== undefined ? String(body.appId) : saved.appId,
+      appSecret:
+        submittedSecret && !submittedSecret.includes("••") ? submittedSecret : saved.appSecret,
+      notifyChatId:
+        body.notifyChatId !== undefined ? String(body.notifyChatId) : saved.notifyChatId,
+    });
+    await db.addAudit({
+      actorId: actor.id,
+      actorUsername: actor.username,
+      action: "test",
+      resource: "settings.feishu",
+      detail: result.messageSent ? "credentials valid; test message sent" : "credentials valid",
+      ip: clientIp(c),
+    });
+    return c.json({ ok: true, ...result });
+  } catch (error) {
+    if (error instanceof FeishuTestError) {
+      const upstreamStatus = error.details.upstreamStatus;
+      const status =
+        error.kind === "validation"
+          ? 400
+          : error.kind === "timeout"
+            ? 504
+            : error.kind === "network"
+              ? 502
+              : upstreamStatus === 429
+                ? 429
+                : upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 500
+                  ? 400
+                  : 502;
+      return c.json(
+        {
+          error: error.message,
+          details: { kind: error.kind, secretSource, ...error.details },
+        },
+        status,
+      );
+    }
+    return c.json({ error: "飞书连接测试失败" }, 500);
+  }
+});
+
+// ---------- admin: SMTP settings ----------
+app.get("/api/admin/settings/smtp", requireAdmin, (c) => {
+  return c.json({ settings: db.getSmtpSettingsPublic() });
+});
+
+app.put("/api/admin/settings/smtp", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  const settings = await db.updateSmtpSettings(
+    {
+      enabled: body.enabled !== undefined ? Boolean(body.enabled) : undefined,
+      host: body.host !== undefined ? String(body.host) : undefined,
+      port: body.port !== undefined ? Number(body.port) : undefined,
+      secure: body.secure !== undefined ? Boolean(body.secure) : undefined,
+      username: body.username !== undefined ? String(body.username) : undefined,
+      password: body.password !== undefined ? String(body.password) : undefined,
+      fromAddress: body.fromAddress !== undefined ? String(body.fromAddress) : undefined,
+      fromName: body.fromName !== undefined ? String(body.fromName) : undefined,
+      replyTo: body.replyTo !== undefined ? String(body.replyTo) : undefined,
+    },
+    actor.username,
+  );
+  await db.addAudit({
+    actorId: actor.id,
+    actorUsername: actor.username,
+    action: "update",
+    resource: "settings.smtp",
+    detail: `enabled=${settings.enabled} host=${settings.host}:${settings.port}`,
+    ip: clientIp(c),
+  });
+  return c.json({ ok: true, settings: db.getSmtpSettingsPublic() });
+});
+
+app.post("/api/admin/settings/smtp/test", requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const saved = db.getSmtpSettings();
+  const candidate = {
+    ...saved,
+    host: body.host !== undefined ? String(body.host).trim() : saved.host,
+    port: body.port !== undefined ? Number(body.port) : saved.port,
+    secure: body.secure !== undefined ? Boolean(body.secure) : saved.secure,
+    username: body.username !== undefined ? String(body.username).trim() : saved.username,
+    password:
+      body.password && !String(body.password).includes("••")
+        ? String(body.password)
+        : saved.password,
+    fromAddress:
+      body.fromAddress !== undefined ? String(body.fromAddress).trim() : saved.fromAddress,
+    fromName: body.fromName !== undefined ? String(body.fromName).trim() : saved.fromName,
+    replyTo: body.replyTo !== undefined ? String(body.replyTo).trim() : saved.replyTo,
+  };
+  try {
+    await verifySmtpSettings(candidate);
+    return c.json({ ok: true });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "SMTP 连接失败" }, 502);
+  }
+});
+
+app.post("/api/admin/settings/feishu/chats", requireAdmin, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const saved = db.getFeishuSettings();
+  const submittedSecret = body.appSecret !== undefined ? String(body.appSecret).trim() : "";
+  const secretSource =
+    submittedSecret && !submittedSecret.includes("••")
+      ? "current_input"
+      : saved.appSecret
+        ? "saved"
+        : "missing";
+
+  try {
+    const result = await listFeishuChats({
+      appId: body.appId !== undefined ? String(body.appId) : saved.appId,
+      appSecret:
+        submittedSecret && !submittedSecret.includes("••") ? submittedSecret : saved.appSecret,
+    });
+    return c.json({ ok: true, ...result });
+  } catch (error) {
+    if (error instanceof FeishuTestError) {
+      const upstreamStatus = error.details.upstreamStatus;
+      const status =
+        error.kind === "validation"
+          ? 400
+          : error.kind === "timeout"
+            ? 504
+            : error.kind === "network"
+              ? 502
+              : upstreamStatus === 429
+                ? 429
+                : upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 500
+                  ? 400
+                  : 502;
+      return c.json(
+        {
+          error: error.message,
+          details: { kind: error.kind, secretSource, ...error.details },
+        },
+        status,
+      );
+    }
+    return c.json({ error: "获取飞书群列表失败" }, 500);
+  }
+});
+
 // ---------- admin: overview ----------
 app.get("/api/admin/overview", requireAdmin, async (c) => {
   const global = db.globalStats();
@@ -731,6 +1202,56 @@ app.get("/api/admin/overview", requireAdmin, async (c) => {
     },
   });
 });
+
+// ---------- API push inbound ----------
+function secretMatches(provided: string, expected: string): boolean {
+  const left = Buffer.from(provided);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+app.post(
+  "/v1/inbound/json/:channelId",
+  bodyLimit({
+    maxSize: config.MAX_BODY_BYTES,
+    onError: (c) => c.json({ error: "payload too large" }, 413),
+  }),
+  async (c) => {
+    const channel = db.getReceiveChannel(c.req.param("channelId"));
+    if (!channel || channel.type !== "api_push" || !channel.enabled) {
+      return c.json({ error: "接收渠道不可用" }, 404);
+    }
+    const authorization = c.req.header("authorization") || "";
+    const token = authorization.replace(/^Bearer\s+/i, "").trim() || c.req.header("x-inbound-key") || "";
+    if (!token || !secretMatches(token, channel.pushToken)) {
+      return c.json({ error: "unauthorized" }, 401);
+    }
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object") return c.json({ error: "invalid json" }, 400);
+    try {
+      const result = await ingestApiMail(
+        db,
+        channel,
+        body,
+        config.MAX_BODY_BYTES,
+        undefined,
+        notifyInboundMail,
+      );
+      if (!result.duplicate) {
+        await db.addAudit({
+          action: "inbound",
+          resource: "mail",
+          resourceId: result.id,
+          detail: `tenant=${result.tenant} source=${channel.name}`,
+          ip: clientIp(c),
+        });
+      }
+      return c.json({ ok: true, ...result }, result.duplicate ? 200 : 201);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "邮件上报失败" }, 400);
+    }
+  },
+);
 
 // ---------- inbound webhook (from CF Worker) ----------
 function decodeMaybeB64(value: string): string {
@@ -754,8 +1275,30 @@ app.post(
     const raw = Buffer.from(await c.req.arrayBuffer());
     if (raw.byteLength === 0) return c.json({ error: "empty body" }, 400);
 
+    const envelopeTo = (c.req.header("x-email-to") || "").trim().toLowerCase();
+    const legacyRecipient = resolveLegacyInboundRecipient(envelopeTo, config.INBOUND_DOMAIN);
+    const boundDomain = db.findDomainByAddress(envelopeTo);
+    const boundChannel = db.getReceiveChannel(boundDomain?.receiveChannelId);
+    const forwardedChannel = db.getReceiveChannel(c.req.header("x-receive-channel-id") || "");
+    if (boundChannel?.type === "worker" && !boundChannel.enabled) {
+      return c.json({ error: "receive channel disabled" }, 403);
+    }
+    const directWorker = Boolean(boundDomain && boundChannel?.type === "worker");
+    const emailForward = Boolean(
+      !directWorker &&
+      legacyRecipient &&
+      forwardedChannel?.type === "email_forward" &&
+      forwardedChannel.enabled,
+    );
+    if (!directWorker && !emailForward) {
+      return c.json({ error: "recipient is not bound to an active receive channel" }, 403);
+    }
+    const signatureSecret =
+      directWorker && boundDomain
+        ? deriveDomainWebhookSecret(config.WEBHOOK_SECRET, boundDomain.id)
+        : forwardedChannel?.pushToken || "";
     const check = verifySignature({
-      secret: config.WEBHOOK_SECRET,
+      secret: signatureSecret,
       timestamp: c.req.header("x-timestamp") || "",
       signatureHeader: c.req.header("x-signature") || "",
       body: raw,
@@ -766,11 +1309,18 @@ app.post(
       return c.json({ error: "unauthorized", reason: check.reason }, 401);
     }
 
-    const tenant = (c.req.header("x-tenant") || "").toLowerCase().trim();
-    const channel = (c.req.header("x-channel") || "default").toLowerCase().trim();
+    let tenant = "";
+    let channel = "";
+    if (directWorker && boundDomain && boundChannel) {
+      const owner = db.findUserById(boundDomain.userId);
+      if (!owner || owner.status !== "active") return c.json({ error: "domain owner unavailable" }, 403);
+      tenant = owner.tenant;
+      channel = boundChannel.name;
+    } else {
+      tenant = legacyRecipient?.tenant || "";
+      channel = forwardedChannel?.name || "email-forward";
+    }
     if (!tenant) return c.json({ error: "missing x-tenant" }, 400);
-
-    // Accept SaaS dashboard users OR DuckMail-compatible mailbox accounts
     if (!db.isKnownTenant(tenant)) {
       return c.json({ error: "unknown tenant", tenant }, 403);
     }
@@ -785,7 +1335,8 @@ app.post(
 
     const from = c.req.header("x-email-from") || parsed.from;
     const to = c.req.header("x-email-to") || parsed.to[0] || "";
-    const subject = decodeMaybeB64(c.req.header("x-email-subject") || "") || parsed.subject;
+    const envelopeSubject = decodeMaybeB64(c.req.header("x-email-subject") || "");
+    const subject = envelopeSubject && !envelopeSubject.startsWith("=?") ? envelopeSubject : parsed.subject;
     const messageId = c.req.header("x-message-id") || parsed.messageId;
 
     const { meta, duplicate } = await db.saveMail({
@@ -806,6 +1357,14 @@ app.post(
     });
 
     if (!duplicate) {
+      void notifyInboundMail({
+        id: meta.id,
+        tenant,
+        channel,
+        from,
+        to,
+        subject,
+      });
       await db.addAudit({
         action: "inbound",
         resource: "mail",

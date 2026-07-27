@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Badge,
   Banner,
@@ -10,7 +10,7 @@ import {
   Dialog,
   Input,
   LayerCard,
-  Radio,
+  Select,
   Tabs,
   Text,
 } from "@cloudflare/kumo";
@@ -31,19 +31,36 @@ import {
   qs,
   type Domain,
   type DomainVisibility,
+  type ReceiveChannel,
+  type SmtpStatus,
   type WorkerSnippet,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { useStableToast } from "@/lib/toast";
 
-type WizardStep = "register" | "forward" | "worker" | "test";
+type WizardStep = "configure" | "guide" | "test";
+type TestState = "idle" | "sending" | "waiting" | "success" | "timeout";
 
 const STEP_META: { id: WizardStep; label: string; n: number }[] = [
-  { id: "register", label: "登记域名", n: 1 },
-  { id: "forward", label: "邮箱转发", n: 2 },
-  { id: "worker", label: "绑定 Worker", n: 3 },
-  { id: "test", label: "发送测试", n: 4 },
+  { id: "configure", label: "域名与渠道", n: 1 },
+  { id: "guide", label: "接入配置", n: 2 },
+  { id: "test", label: "自动测试", n: 3 },
 ];
+
+const CHANNEL_LABEL: Record<ReceiveChannel["type"], string> = {
+  worker: "Cloudflare Worker",
+  email_forward: "邮箱转发",
+  donemail: "DoneMail API",
+  api_push: "API 主动上报",
+};
+
+function makeWorkerName(tenant: string, domain: string): string {
+  const suffix = domain
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `touch-mail-${tenant}-${suffix || "domain"}`.slice(0, 63).replace(/-+$/, "");
+}
 
 export default function DomainsPage() {
   const { user } = useAuth();
@@ -53,96 +70,214 @@ export default function DomainsPage() {
   const [pageSize] = useState(20);
   const [total, setTotal] = useState(0);
   const [rows, setRows] = useState<Domain[]>([]);
+  const [channels, setChannels] = useState<ReceiveChannel[]>([]);
+  const [smtp, setSmtp] = useState<SmtpStatus | null>(null);
+  const [publicUrl, setPublicUrl] = useState("");
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(false);
-  const [step, setStep] = useState<WizardStep>("register");
+  const [step, setStep] = useState<WizardStep>("configure");
   const [domain, setDomain] = useState("");
   const [note, setNote] = useState("");
   const [visibility, setVisibility] = useState<DomainVisibility>("private");
-  const [savedDomain, setSavedDomain] = useState("");
+  const [receiveChannelId, setReceiveChannelId] = useState("");
+  const [workerName, setWorkerName] = useState("");
+  const [workerNameTouched, setWorkerNameTouched] = useState(false);
+  const [savedDomain, setSavedDomain] = useState<Domain | null>(null);
   const [saving, setSaving] = useState(false);
   const [snippet, setSnippet] = useState<WorkerSnippet | null>(null);
   const [codeTab, setCodeTab] = useState("js");
+  const [testRecipient, setTestRecipient] = useState("");
+  const [testState, setTestState] = useState<TestState>("idle");
   const isAdmin = user?.role === "admin";
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const params = qs({ q, page, pageSize });
-      const res = isAdmin ? await api.adminDomains(params) : await api.domains(params);
-      setRows(res.items ?? []);
-      setTotal(res.total ?? 0);
-    } catch (e) {
-      toast.error("加载失败", e instanceof Error ? e.message : "");
+      const result = isAdmin ? await api.adminDomains(params) : await api.domains(params);
+      setRows(result.items ?? []);
+      setTotal(result.total ?? 0);
+    } catch (error) {
+      toast.error("加载失败", error instanceof Error ? error.message : "");
     } finally {
       setLoading(false);
     }
   }, [q, page, pageSize, isAdmin, toast]);
 
-  const loadSnippet = useCallback(async () => {
-    try {
-      const s = await api.workerSnippet();
-      setSnippet(s);
-    } catch {
-      /* page still usable without snippet */
-    }
-  }, []);
-
   useEffect(() => {
-    if (user) {
-      void load();
-      void loadSnippet();
-    }
-  }, [user?.id, user?.role, load, loadSnippet]);
+    if (!user) return;
+    void load();
+    api
+      .receiveChannels()
+      .then((result) => {
+        setChannels(result.items || []);
+        setReceiveChannelId((current) => current || result.items?.[0]?.id || "");
+      })
+      .catch((error) =>
+        toast.error("无法加载收件渠道", error instanceof Error ? error.message : ""),
+      );
+    api.smtpStatus().then(setSmtp).catch(() => setSmtp(null));
+    api.config().then((config) => setPublicUrl(config.publicUrl)).catch(() => setPublicUrl(""));
+  }, [user, load, toast]);
 
-  const inboundAddress = snippet?.inboundAddress || user?.inboundAddress || "";
-  const inboundDomain = useMemo(() => {
-    const a = inboundAddress;
-    const at = a.lastIndexOf("@");
-    return at > 0 ? a.slice(at + 1) : "";
-  }, [inboundAddress]);
+  const selectedChannel = channels.find((channel) => channel.id === receiveChannelId) || null;
+  const forwardingAddress =
+    selectedChannel?.type === "email_forward" && user
+      ? selectedChannel.forwardingAddressTemplate
+          .replaceAll("{tenant}", user.tenant)
+          .replaceAll("{domain}", savedDomain?.domain || domain.trim().toLowerCase())
+      : "";
+  const apiPushEndpoint =
+    selectedChannel?.type === "api_push" && publicUrl
+      ? `${publicUrl.replace(/\/$/, "")}/v1/inbound/json/${selectedChannel.id}`
+      : "";
+  const canManageSavedDomain = !savedDomain || !isAdmin || savedDomain.userId === user?.id;
 
-  function openWizard(prefill?: Domain | string) {
-    if (typeof prefill === "object" && prefill) {
-      setDomain(prefill.domain);
-      setNote(prefill.note || "");
-      setVisibility(prefill.visibility === "public" ? "public" : "private");
-      setSavedDomain(prefill.domain);
-      setStep("forward");
-    } else {
-      setDomain(typeof prefill === "string" ? prefill : "");
-      setNote("");
-      setVisibility("private");
-      setSavedDomain(typeof prefill === "string" ? prefill : "");
-      setStep(prefill ? "forward" : "register");
+  async function loadSnippet(domainId: string) {
+    setSnippet(null);
+    try {
+      setSnippet(await api.workerSnippet(domainId));
+    } catch (error) {
+      toast.error("Worker 配置加载失败", error instanceof Error ? error.message : "");
     }
-    setCodeTab("js");
-    setOpen(true);
-    if (!snippet) void loadSnippet();
   }
 
-  function closeWizard() {
-    setOpen(false);
-    setStep("register");
+  function resetWizard() {
+    setStep("configure");
     setDomain("");
     setNote("");
     setVisibility("private");
-    setSavedDomain("");
+    setReceiveChannelId(channels[0]?.id || "");
+    setWorkerName("");
+    setWorkerNameTouched(false);
+    setSavedDomain(null);
+    setSnippet(null);
+    setCodeTab("js");
+    setTestRecipient("");
+    setTestState("idle");
   }
 
-  async function toggleVisibility(r: Domain) {
-    // Admin viewing others' domains: only owner can patch via tenant API
-    if (isAdmin && r.userId !== user?.id) {
+  function openWizard(item?: Domain) {
+    if (!item) {
+      resetWizard();
+      setOpen(true);
+      return;
+    }
+    setDomain(item.domain);
+    setNote(item.note || "");
+    setVisibility(item.visibility);
+    setReceiveChannelId(item.receiveChannelId || "");
+    setWorkerName(item.workerName || "");
+    setWorkerNameTouched(Boolean(item.workerName));
+    setSavedDomain(item);
+    setTestRecipient(`test@${item.domain}`);
+    setTestState("idle");
+    setCodeTab("js");
+    setStep("guide");
+    setOpen(true);
+    const channel = channels.find((candidate) => candidate.id === item.receiveChannelId);
+    if (channel?.type === "worker" && (!isAdmin || item.userId === user?.id)) {
+      void loadSnippet(item.id);
+    } else {
+      setSnippet(null);
+    }
+  }
+
+  async function saveDomain() {
+    const normalizedDomain = domain.trim().toLowerCase();
+    if (!normalizedDomain) {
+      toast.error("请填写域名");
+      return;
+    }
+    if (!selectedChannel) {
+      toast.error("请选择管理员已启用的收件渠道");
+      return;
+    }
+    if (selectedChannel.type === "worker" && !workerName.trim()) {
+      toast.error("必须填写 Worker Name");
+      return;
+    }
+    setSaving(true);
+    try {
+      const result = savedDomain
+        ? await api.updateDomain(savedDomain.id, {
+            note,
+            visibility,
+            receiveChannelId: selectedChannel.id,
+            workerName,
+          })
+        : await api.createDomain(
+            normalizedDomain,
+            note,
+            visibility,
+            selectedChannel.id,
+            workerName,
+          );
+      setSavedDomain(result.domain);
+      setDomain(result.domain.domain);
+      setWorkerName(result.domain.workerName || workerName);
+      setTestRecipient(`test@${result.domain.domain}`);
+      setStep("guide");
+      setTestState("idle");
+      toast.success(savedDomain ? "域名接入配置已更新" : "域名已登记");
+      await load();
+      if (selectedChannel.type === "worker") await loadSnippet(result.domain.id);
+      else setSnippet(null);
+    } catch (error) {
+      toast.error("保存失败", error instanceof Error ? error.message : "");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function runDomainTest() {
+    if (!savedDomain) return;
+    if (!smtp?.enabled) {
+      toast.error("无法发送测试邮件", "管理员尚未启用 SMTP");
+      return;
+    }
+    setTestState("sending");
+    try {
+      const sent = await api.sendDomainTest(savedDomain.id, testRecipient);
+      setTestRecipient(sent.recipient);
+      setTestState("waiting");
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const status = await api.domainTestStatus(savedDomain.id, sent.token);
+        if (status.received) {
+          setTestState("success");
+          toast.success("域名接入成功", "测试邮件已经从所选收件渠道回到系统");
+          return;
+        }
+      }
+      setTestState("timeout");
+    } catch (error) {
+      setTestState("idle");
+      toast.error("接入测试失败", error instanceof Error ? error.message : "");
+    }
+  }
+
+  async function copyCode(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(`${label}已复制`);
+    } catch {
+      toast.error("复制失败", "请手动选择代码复制");
+    }
+  }
+
+  async function toggleVisibility(item: Domain) {
+    if (isAdmin && item.userId !== user?.id) {
       toast.error("只能修改自己的域名可见性");
       return;
     }
-    const next: DomainVisibility = r.visibility === "public" ? "private" : "public";
+    const next: DomainVisibility = item.visibility === "public" ? "private" : "public";
     try {
-      await api.updateDomain(r.id, { visibility: next });
+      await api.updateDomain(item.id, { visibility: next });
       toast.success(next === "public" ? "已设为公开" : "已设为私有");
       void load();
-    } catch (e) {
-      toast.error("更新失败", e instanceof Error ? e.message : "");
+    } catch (error) {
+      toast.error("更新失败", error instanceof Error ? error.message : "");
     }
   }
 
@@ -150,14 +285,29 @@ export default function DomainsPage() {
     {
       key: "domain",
       header: "域名",
-      cell: (r) => <Text size="sm">{r.domain}</Text>,
+      cell: (item) => <Text size="sm">{item.domain}</Text>,
+    },
+    {
+      key: "channel",
+      header: "收件渠道",
+      cell: (item) => {
+        const channel = channels.find((candidate) => candidate.id === item.receiveChannelId);
+        return channel ? (
+          <div className="flex flex-col gap-1">
+            <Text size="sm">{channel.name}</Text>
+            <Badge variant="outline">{CHANNEL_LABEL[channel.type]}</Badge>
+          </div>
+        ) : (
+          <Badge variant="secondary">未配置</Badge>
+        );
+      },
     },
     {
       key: "visibility",
       header: "可见性",
-      cell: (r) => (
-        <Badge variant={r.visibility === "public" ? "primary" : "secondary"}>
-          {r.visibility === "public" ? "公开" : "私有"}
+      cell: (item) => (
+        <Badge variant={item.visibility === "public" ? "primary" : "secondary"}>
+          {item.visibility === "public" ? "公开" : "私有"}
         </Badge>
       ),
     },
@@ -166,43 +316,39 @@ export default function DomainsPage() {
           {
             key: "owner",
             header: "所属用户",
-            cell: (r: Domain) => (
+            cell: (item: Domain) => (
               <Text size="sm" variant="secondary">
-                {r.username || r.userId} / {r.tenant || "—"}
+                {item.username || item.userId} / {item.tenant || "—"}
               </Text>
             ),
           } as Column<Domain>,
         ]
       : []),
     {
-      key: "note",
-      header: "备注",
-      cell: (r) => (
-        <Text size="sm" variant="secondary">
-          {r.note || "—"}
-        </Text>
-      ),
-    },
-    {
       key: "createdAt",
       header: "添加时间",
-      cell: (r) => (
+      cell: (item) => (
         <Text size="sm" variant="secondary">
-          {formatDate(r.createdAt)}
+          {formatDate(item.createdAt)}
         </Text>
       ),
     },
     {
       key: "actions",
       header: "操作",
-      cell: (r) => (
-        <div className="flex flex-wrap items-center gap-2">
-          <Button size="sm" variant="secondary" icon={BookOpenIcon} onClick={() => openWizard(r)}>
-            接入指南
+      cell: (item) => (
+        <div className="flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={BookOpenIcon}
+            onClick={() => openWizard(item)}
+          >
+            接入配置
           </Button>
-          {(!isAdmin || r.userId === user?.id) && (
-            <Button size="sm" variant="ghost" onClick={() => void toggleVisibility(r)}>
-              {r.visibility === "public" ? "改私有" : "改公开"}
+          {(!isAdmin || item.userId === user?.id) && (
+            <Button size="sm" variant="ghost" onClick={() => void toggleVisibility(item)}>
+              {item.visibility === "public" ? "改私有" : "改公开"}
             </Button>
           )}
           <Button
@@ -210,14 +356,14 @@ export default function DomainsPage() {
             variant="destructive"
             icon={TrashIcon}
             onClick={async () => {
-              if (!confirm(`删除域名 ${r.domain}？`)) return;
+              if (!confirm(`删除域名 ${item.domain}？`)) return;
               try {
-                if (isAdmin && r.userId !== user?.id) await api.adminDeleteDomain(r.id);
-                else await api.deleteDomain(r.id);
+                if (isAdmin && item.userId !== user?.id) await api.adminDeleteDomain(item.id);
+                else await api.deleteDomain(item.id);
                 toast.success("已删除");
                 void load();
-              } catch (e) {
-                toast.error("删除失败", e instanceof Error ? e.message : "");
+              } catch (error) {
+                toast.error("删除失败", error instanceof Error ? error.message : "");
               }
             }}
           >
@@ -228,112 +374,46 @@ export default function DomainsPage() {
     },
   ];
 
-  const stepIndex = STEP_META.findIndex((s) => s.id === step);
+  const stepIndex = STEP_META.findIndex((item) => item.id === step);
+  const busyTesting = testState === "sending" || testState === "waiting";
 
   return (
     <AdminShell>
       <PageHeader
         title="域名"
-        description={
-          isAdmin
-            ? "全站客户域名台账 · 添加后需完成转发与 Worker 绑定"
-            : "绑定客户域名 · 按向导完成转发、Worker 与测试"
-        }
+        description="为域名选择管理员发布的收件渠道，并按渠道完成接入"
         actions={
-          <Button icon={PlusIcon} onClick={() => openWizard()}>
+          <Button icon={PlusIcon} onClick={() => openWizard()} disabled={channels.length === 0}>
             添加域名
           </Button>
         }
       />
-
-      <Banner
-        className="mb-4"
-        variant="alert"
-        title="登记域名 ≠ 邮件已接通"
-        description="本页只做台账。客户邮箱必须转发到你的入站地址，且 Cloudflare Email Worker 已部署并绑定入站域后，邮件才会进入系统。"
-      />
-
-      <LayerCard className="mb-6">
-        <LayerCard.Secondary>接入总览</LayerCard.Secondary>
-        <LayerCard.Primary>
-          <div className="flex flex-col gap-4">
-            <Text size="sm" variant="secondary">
-              推荐链路：客户邮箱 → 转发到入站地址 → Email Routing 触发 Worker → HTTPS 推送到本服务。
-            </Text>
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="flex flex-col gap-2">
-                <Text size="sm">你的入站地址</Text>
-                {inboundAddress ? (
-                  <ClipboardText
-                    text={inboundAddress}
-                    size="base"
-                    tooltip={{ text: "复制", copiedText: "已复制" }}
-                    labels={{ copyAction: "复制入站地址" }}
-                  />
-                ) : (
-                  <Text variant="secondary" size="sm">
-                    加载中…
-                  </Text>
-                )}
-                <Text size="xs" variant="secondary">
-                  客户把 support@客户域 完整转发到此地址（或 {user?.tenant || "tenant"}+orders@
-                  {inboundDomain || "入站域"} 做渠道分流）。
-                </Text>
-              </div>
-              <div className="flex flex-col gap-2">
-                <Text size="sm">Webhook</Text>
-                {snippet?.webhookUrl ? (
-                  <ClipboardText
-                    text={snippet.webhookUrl}
-                    size="base"
-                    tooltip={{ text: "复制", copiedText: "已复制" }}
-                    labels={{ copyAction: "复制 Webhook" }}
-                  />
-                ) : (
-                  <Text variant="secondary" size="sm">
-                    —
-                  </Text>
-                )}
-                <Text size="xs" variant="secondary">
-                  Worker 向该地址 POST 原始邮件（HMAC 签名）。本地开发时需公网可达或用模拟脚本。
-                </Text>
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button
-                size="sm"
-                variant="secondary"
-                icon={BookOpenIcon}
-                onClick={() => openWizard(rows[0])}
-              >
-                打开接入向导
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  openWizard(rows[0]);
-                  setStep("worker");
-                }}
-              >
-                仅查看 Worker 代码
-              </Button>
-            </div>
-          </div>
-        </LayerCard.Primary>
-      </LayerCard>
+      {channels.length === 0 ? (
+        <Banner
+          className="mb-4"
+          variant="alert"
+          title="暂无可用收件渠道"
+          description="需要管理员先在“收件渠道”中创建并启用至少一个渠道。"
+        />
+      ) : (
+        <Banner
+          className="mb-4"
+          variant="secondary"
+          title="先选收件渠道，再按渠道配置"
+          description="Worker 直连不需要邮箱转发；只有选择邮箱转发渠道时，才需要把原邮箱转到管理员配置的目标地址。"
+        />
+      )}
 
       <div className="mb-4">
         <SearchBar
           value={q}
           placeholder="搜索域名 / 备注"
-          onSearch={(v) => {
+          onSearch={(value) => {
             setPage(1);
-            setQ(v);
+            setQ(value);
           }}
         />
       </div>
-
       <DataTable
         columns={columns}
         rows={rows}
@@ -346,278 +426,411 @@ export default function DomainsPage() {
 
       <Dialog.Root
         open={open}
-        onOpenChange={(v) => {
-          if (!v) closeWizard();
-          else setOpen(true);
+        onOpenChange={(value) => {
+          setOpen(value);
+          if (!value) resetWizard();
         }}
       >
         <Dialog size="xl" className="max-h-[90vh] overflow-y-auto p-6">
-          <Dialog.Title>域名接入向导</Dialog.Title>
-          <Text variant="secondary" size="sm" className="mt-1">
-            按步骤完成登记、转发、Worker 绑定与测试。跳过任一步都可能导致收不到邮件。
-          </Text>
-
+          <Dialog.Title>域名接入</Dialog.Title>
+          <div className="mt-1">
+            <Text size="sm" variant="secondary">
+              收件渠道由管理员维护；配置完成后系统使用 SMTP 自动发信验证整条链路。
+            </Text>
+          </div>
           <div className="mt-4 flex flex-wrap gap-2">
-            {STEP_META.map((s, i) => {
-              const active = s.id === step;
-              const done = i < stepIndex;
-              return (
-                <Button
-                  key={s.id}
-                  size="sm"
-                  variant={active ? "primary" : done ? "secondary" : "ghost"}
-                  icon={done ? CheckCircleIcon : undefined}
-                  onClick={() => {
-                    if (s.id !== "register" && !savedDomain && !domain.trim()) {
-                      toast.error("请先登记域名");
-                      return;
-                    }
-                    setStep(s.id);
-                  }}
-                >
-                  {s.n}. {s.label}
-                </Button>
-              );
-            })}
+            {STEP_META.map((item, index) => (
+              <Button
+                key={item.id}
+                size="sm"
+                variant={item.id === step ? "primary" : index < stepIndex ? "secondary" : "ghost"}
+                icon={index < stepIndex ? CheckCircleIcon : undefined}
+                disabled={item.id !== "configure" && !savedDomain}
+                onClick={() => setStep(item.id)}
+              >
+                {item.n}. {item.label}
+              </Button>
+            ))}
           </div>
 
           <div className="mt-6 flex flex-col gap-4">
-            {step === "register" ? (
+            {step === "configure" ? (
               <>
-                <Banner
-                  title="第 1 步 · 登记客户域名"
-                  description="仅写入台账，便于你管理「哪个客户域在用」。真正收信依赖后续转发与 Worker。"
-                />
+                {!canManageSavedDomain ? (
+                  <Banner
+                    variant="alert"
+                    title="只读配置"
+                    description="管理员正在查看其他用户的域名；请由域名所属用户修改接入配置。"
+                  />
+                ) : null}
                 <Input
-                  label="客户域名"
+                  label="域名"
                   value={domain}
-                  onChange={(e) => setDomain(e.target.value)}
-                  placeholder="example.com 或 mail.example.com"
+                  disabled={Boolean(savedDomain) || !canManageSavedDomain}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setDomain(value);
+                    if (!workerNameTouched && user) setWorkerName(makeWorkerName(user.tenant, value));
+                  }}
+                  placeholder="example.com"
+                  required
                 />
                 <Input
                   label="备注"
                   value={note}
-                  onChange={(e) => setNote(e.target.value)}
-                  placeholder="例如：客户 A 的 support 邮箱"
+                  disabled={!canManageSavedDomain}
+                  onChange={(event) => setNote(event.target.value)}
+                  placeholder="例如：客户 A 的业务邮箱"
                 />
-                <Radio.Group
-                  legend="可见性（DuckMail /domains）"
-                  appearance="card"
+                <Select
+                  label="收件渠道"
+                  description="只能选择管理员已经启用的渠道"
+                  hideLabel={false}
+                  value={receiveChannelId}
+                  disabled={!canManageSavedDomain}
+                  onValueChange={(value) => {
+                    const channelId = String(value);
+                    const channel = channels.find((candidate) => candidate.id === channelId);
+                    setReceiveChannelId(channelId);
+                    if (channel?.type === "worker" && !workerNameTouched && user) {
+                      setWorkerName(makeWorkerName(user.tenant, domain));
+                    }
+                  }}
+                >
+                  {channels.map((channel) => (
+                    <Select.Option key={channel.id} value={channel.id}>
+                      {channel.name} · {CHANNEL_LABEL[channel.type]}
+                    </Select.Option>
+                  ))}
+                </Select>
+                {selectedChannel ? (
+                  <Banner
+                    variant="secondary"
+                    title={CHANNEL_LABEL[selectedChannel.type]}
+                    description={selectedChannel.description || "管理员已启用该收件渠道"}
+                  />
+                ) : null}
+                {selectedChannel?.type === "worker" ? (
+                  <>
+                    <Input
+                      label="Worker Name"
+                      description="必须与 Cloudflare 中创建的 Worker 名称完全一致；可修改，但两边必须同步。"
+                      value={workerName}
+                      disabled={!canManageSavedDomain}
+                      onChange={(event) => {
+                        setWorkerNameTouched(true);
+                        setWorkerName(event.target.value.toLowerCase());
+                      }}
+                      placeholder="touch-mail-tenant-example-com"
+                      required
+                    />
+                    {workerName ? (
+                      <ClipboardText
+                        text={workerName}
+                        size="base"
+                        tooltip={{ text: "复制", copiedText: "已复制" }}
+                        labels={{ copyAction: "复制 Worker Name" }}
+                      />
+                    ) : null}
+                  </>
+                ) : null}
+                <Select
+                  label="DuckMail /domains 可见性"
+                  hideLabel={false}
                   value={visibility}
-                  onValueChange={(v) =>
-                    setVisibility(v === "public" ? "public" : "private")
+                  disabled={!canManageSavedDomain}
+                  onValueChange={(value) =>
+                    setVisibility(value === "public" ? "public" : "private")
                   }
                 >
-                  <Radio.Item
-                    label="私有（推荐）"
-                    description="仅你的 API Key 可见，适合正式客户域"
-                    value="private"
-                  />
-                  <Radio.Item
-                    label="公开"
-                    description="任何人调用 /domains 都能看到，无需 Key 即可在此域创建邮箱"
-                    value="public"
-                  />
-                </Radio.Group>
+                  <Select.Option value="private">私有（推荐）</Select.Option>
+                  <Select.Option value="public">公开</Select.Option>
+                </Select>
                 <div className="flex justify-end gap-2">
-                  <Button variant="secondary" onClick={closeWizard}>
+                  <Button variant="secondary" onClick={() => setOpen(false)}>
                     取消
                   </Button>
                   <Button
                     loading={saving}
+                    disabled={!canManageSavedDomain || !selectedChannel}
                     icon={ArrowRightIcon}
-                    onClick={async () => {
-                      const d = domain.trim().toLowerCase();
-                      if (!d) {
-                        toast.error("请填写域名");
-                        return;
-                      }
-                      setSaving(true);
-                      try {
-                        await api.createDomain(d, note, visibility);
-                        setSavedDomain(d);
-                        toast.success(
-                          visibility === "public" ? "域名已登记（公开）" : "域名已登记（私有）",
-                        );
-                        void load();
-                        setStep("forward");
-                      } catch (e) {
-                        // already exists → still continue wizard with this domain
-                        const msg = e instanceof Error ? e.message : "";
-                        if (/已存在|exist|duplicate/i.test(msg)) {
-                          setSavedDomain(d);
-                          toast.success("域名已在台账中，继续配置");
-                          setStep("forward");
-                        } else {
-                          toast.error("登记失败", msg);
-                        }
-                      } finally {
-                        setSaving(false);
-                      }
-                    }}
+                    onClick={() => void saveDomain()}
                   >
-                    保存并下一步
+                    保存并查看接入配置
                   </Button>
                 </div>
               </>
             ) : null}
 
-            {step === "forward" ? (
+            {step === "guide" && savedDomain ? (
               <>
-                <Banner
-                  title="第 2 步 · 配置邮箱转发"
-                  description={`在客户邮箱（或企业邮箱管理后台）把目标地址完整转发到入站地址。域名 ${savedDomain || domain || "（客户域）"} 本身不需要 MX 指向本服务。`}
-                />
-                <LayerCard>
-                  <LayerCard.Secondary>转发目标（入站地址）</LayerCard.Secondary>
-                  <LayerCard.Primary>
-                    <div className="flex flex-col gap-3">
-                      {inboundAddress ? (
+                {selectedChannel?.type === "worker" ? (
+                  <>
+                    <Banner
+                      variant="alert"
+                      title={`Worker Name 必须保持为 ${savedDomain.workerName}`}
+                      description="创建 Worker、wrangler.toml 的 name，以及 Email Routing 规则中选择的 Worker，三处名称必须完全一致。Worker 直连不需要邮箱转发。"
+                    />
+                    <LayerCard>
+                      <LayerCard.Secondary>Worker Name</LayerCard.Secondary>
+                      <LayerCard.Primary>
                         <ClipboardText
-                          text={inboundAddress}
+                          text={savedDomain.workerName}
                           size="lg"
                           tooltip={{ text: "复制", copiedText: "已复制" }}
-                          labels={{ copyAction: "复制入站地址" }}
+                          labels={{ copyAction: "复制 Worker Name" }}
                         />
-                      ) : (
-                        <Text variant="secondary">无法加载入站地址</Text>
-                      )}
-                      <Text size="sm" variant="secondary">
-                        示例：把{" "}
-                        <Text as="span" size="sm">
-                          support@{savedDomain || domain || "customer.com"}
-                        </Text>{" "}
-                        的自动转发 / 别名指向上面的地址。
-                      </Text>
-                      <Text size="sm" variant="secondary">
-                        多业务线可用 plus 地址：
-                        {user?.tenant || "tenant"}+orders@{inboundDomain || "inbound.example.com"}
-                      </Text>
+                      </LayerCard.Primary>
+                    </LayerCard>
+                    <LayerCard>
+                      <LayerCard.Secondary>创建并部署 Worker</LayerCard.Secondary>
+                      <LayerCard.Primary>
+                        <div className="flex flex-col gap-2">
+                          {(snippet?.setupSteps || []).map((line, index) => (
+                            <Text key={line} size="sm">
+                              {index + 1}. {line}
+                            </Text>
+                          ))}
+                        </div>
+                      </LayerCard.Primary>
+                    </LayerCard>
+                    <LayerCard>
+                      <LayerCard.Secondary>创建 Email Routing 规则</LayerCard.Secondary>
+                      <LayerCard.Primary>
+                        <div className="flex flex-col gap-2">
+                          {(snippet?.routeSteps || []).map((line, index) => (
+                            <Text key={line} size="sm">
+                              {index + 1}. {line}
+                            </Text>
+                          ))}
+                        </div>
+                      </LayerCard.Primary>
+                    </LayerCard>
+                    {snippet ? (
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <LayerCard>
+                          <LayerCard.Secondary>Webhook URL</LayerCard.Secondary>
+                          <LayerCard.Primary>
+                            <ClipboardText
+                              text={snippet.webhookUrl}
+                              size="sm"
+                              tooltip={{ text: "复制", copiedText: "已复制" }}
+                              labels={{ copyAction: "复制 Webhook URL" }}
+                            />
+                          </LayerCard.Primary>
+                        </LayerCard>
+                        <LayerCard>
+                          <LayerCard.Secondary>WEBHOOK_SECRET</LayerCard.Secondary>
+                          <LayerCard.Primary>
+                            <ClipboardText
+                              text={snippet.webhookSecret}
+                              size="sm"
+                              tooltip={{ text: "复制", copiedText: "已复制" }}
+                              labels={{ copyAction: "复制 Worker Secret" }}
+                            />
+                          </LayerCard.Primary>
+                        </LayerCard>
+                      </div>
+                    ) : null}
+                    <div className="flex items-center justify-between gap-2">
+                      <Tabs
+                        tabs={[
+                          { value: "js", label: "Worker 代码" },
+                          { value: "toml", label: "wrangler.toml" },
+                        ]}
+                        value={codeTab}
+                        onValueChange={setCodeTab}
+                      />
+                      {snippet ? (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() =>
+                            void copyCode(
+                              codeTab === "js" ? snippet.js : snippet.wranglerToml,
+                              codeTab === "js" ? "Worker 代码" : "wrangler.toml",
+                            )
+                          }
+                        >
+                          复制当前代码
+                        </Button>
+                      ) : null}
                     </div>
-                  </LayerCard.Primary>
-                </LayerCard>
-                <Banner
-                  variant="secondary"
-                  title="给客户的一句话"
-                  description={
-                    inboundAddress
-                      ? `请把 support@${savedDomain || domain || "你的公司域名"} 完整转发到：${inboundAddress}`
-                      : "加载入站地址后可复制给客户"
-                  }
-                />
-                <div className="flex justify-between gap-2">
-                  <Button variant="ghost" onClick={() => setStep("register")}>
-                    上一步
-                  </Button>
-                  <Button icon={ArrowRightIcon} onClick={() => setStep("worker")}>
-                    下一步：绑定 Worker
-                  </Button>
-                </div>
-              </>
-            ) : null}
+                    {snippet ? (
+                      <div className="max-h-80 overflow-auto">
+                        <CodeBlock
+                          code={codeTab === "js" ? snippet.js : snippet.wranglerToml}
+                          lang={codeTab === "js" ? "ts" : "bash"}
+                        />
+                      </div>
+                    ) : (
+                      <Button variant="secondary" onClick={() => void loadSnippet(savedDomain.id)}>
+                        重新加载 Worker 配置
+                      </Button>
+                    )}
+                  </>
+                ) : null}
 
-            {step === "worker" ? (
-              <>
-                <Banner
-                  variant="alert"
-                  title="第 3 步 · 部署并绑定 Cloudflare Email Worker"
-                  description={
-                    inboundDomain
-                      ? `在 Cloudflare 上部署 Worker，把入站域 ${inboundDomain} 的 Email Routing Catch-all 指到该 Worker。没有这一步，转发的邮件到不了本服务。`
-                      : "部署 Worker 并将入站域 Email Routing Catch-all 指向它。"
-                  }
-                />
-                <div className="flex flex-col gap-2">
-                  {(snippet?.setupSteps || []).map((line, i) => (
-                    <Text key={i} size="sm">
-                      {i + 1}. {line}
-                    </Text>
-                  ))}
-                </div>
-                {snippet?.webhookUrl ? (
-                  <div className="flex flex-col gap-1">
-                    <Text size="sm">Worker 推送地址</Text>
-                    <ClipboardText
-                      text={snippet.webhookUrl}
-                      size="base"
-                      tooltip={{ text: "复制", copiedText: "已复制" }}
-                      labels={{ copyAction: "复制 Webhook" }}
+                {selectedChannel?.type === "email_forward" ? (
+                  <>
+                    <Banner
+                      title="把业务邮箱转发到管理员配置的收件地址"
+                      description="只有这个渠道需要邮箱转发；无需由用户部署 Worker。"
                     />
-                  </div>
+                    <LayerCard>
+                      <LayerCard.Secondary>转发目标</LayerCard.Secondary>
+                      <LayerCard.Primary>
+                        <ClipboardText
+                          text={forwardingAddress}
+                          size="lg"
+                          tooltip={{ text: "复制", copiedText: "已复制" }}
+                          labels={{ copyAction: "复制转发目标" }}
+                        />
+                      </LayerCard.Primary>
+                    </LayerCard>
+                    <Text size="sm" variant="secondary">
+                      在企业邮箱中，把需要接入的地址完整转发到上面的目标。系统通过目标地址中的租户标识完成归属。
+                    </Text>
+                  </>
                 ) : null}
 
-                <Tabs
-                  tabs={[
-                    { value: "js", label: "Worker 代码" },
-                    { value: "toml", label: "wrangler.toml" },
-                  ]}
-                  value={codeTab}
-                  onValueChange={setCodeTab}
-                />
-                {codeTab === "js" && snippet?.js ? (
-                  <div className="max-h-72 overflow-auto">
-                    <CodeBlock code={snippet.js} lang="ts" />
-                  </div>
-                ) : null}
-                {codeTab === "toml" && snippet?.wranglerToml ? (
-                  <div className="max-h-72 overflow-auto">
-                    <CodeBlock code={snippet.wranglerToml} lang="bash" />
-                  </div>
-                ) : null}
-                {!snippet ? (
-                  <Text variant="secondary" size="sm">
-                    Worker 代码加载失败，请刷新页面后重试。
-                  </Text>
+                {selectedChannel?.type === "donemail" ? (
+                  <>
+                    <Banner
+                      title={`由 ${selectedChannel.name} 同步邮件`}
+                      description="无需转发到 Touch Mail。管理员已经配置 DoneMail API；系统会按收件域名拉取并去重入库。"
+                    />
+                    <Text size="sm">
+                      请确认域名 {savedDomain.domain} 已在对应 DoneMail 实例中完成 MX / Email Routing 接入。
+                    </Text>
+                  </>
                 ) : null}
 
+                {selectedChannel?.type === "api_push" ? (
+                  <>
+                    <Banner
+                      title="由上游系统主动上报邮件"
+                      description="管理员持有该渠道的 Token；上游按约定向下面的接口 POST 邮件 JSON。"
+                    />
+                    {apiPushEndpoint ? (
+                      <ClipboardText
+                        text={apiPushEndpoint}
+                        size="base"
+                        tooltip={{ text: "复制", copiedText: "已复制" }}
+                        labels={{ copyAction: "复制 API 上报地址" }}
+                      />
+                    ) : null}
+                  </>
+                ) : null}
+
+                {!selectedChannel ? (
+                  <Banner
+                    variant="alert"
+                    title="当前渠道已停用或不存在"
+                    description="返回上一步选择新的管理员收件渠道。"
+                  />
+                ) : null}
                 <div className="flex justify-between gap-2">
-                  <Button variant="ghost" onClick={() => setStep("forward")}>
+                  <Button variant="ghost" onClick={() => setStep("configure")}>
                     上一步
                   </Button>
                   <Button icon={ArrowRightIcon} onClick={() => setStep("test")}>
-                    下一步：发送测试
+                    下一步：自动测试
                   </Button>
                 </div>
               </>
             ) : null}
 
-            {step === "test" ? (
+            {step === "test" && savedDomain ? (
               <>
                 <Banner
-                  title="第 4 步 · 发送测试邮件"
-                  description="用任意邮箱向客户业务地址（已配置转发）发一封测试信，然后在「邮件」页确认是否入站。"
+                  title="系统自动发送并验证测试邮件"
+                  description="系统通过管理员 SMTP 发一封带唯一标识的邮件，然后自动等待它从当前收件渠道回到后台。"
                 />
+                {!smtp?.enabled ? (
+                  <Banner
+                    variant="alert"
+                    title="SMTP 尚未配置"
+                    description="管理员必须先在 SMTP 配置中启用发信，域名接入测试才能运行。"
+                  />
+                ) : null}
+                <Input
+                  label="测试收件地址"
+                  description={`必须属于 ${savedDomain.domain}；如果你创建了精确地址路由，请填写与路由一致的地址。`}
+                  type="email"
+                  value={testRecipient}
+                  onChange={(event) => {
+                    setTestRecipient(event.target.value);
+                    setTestState("idle");
+                  }}
+                  placeholder={`test@${savedDomain.domain}`}
+                />
+                <ClipboardText
+                  text={testRecipient || `test@${savedDomain.domain}`}
+                  size="base"
+                  tooltip={{ text: "复制", copiedText: "已复制" }}
+                  labels={{ copyAction: "复制测试地址" }}
+                />
+                {testState === "waiting" ? (
+                  <Banner
+                    variant="secondary"
+                    title="测试邮件已发送，正在等待入站"
+                    description="最长等待约 60 秒，请不要关闭本窗口。"
+                  />
+                ) : null}
+                {testState === "success" ? (
+                  <Banner
+                    title="域名接入成功"
+                    description="测试邮件已从所选渠道回到系统，发信、路由、Worker/API 和入库链路均正常。"
+                  />
+                ) : null}
+                {testState === "timeout" ? (
+                  <Banner
+                    variant="alert"
+                    title="暂未收到测试邮件"
+                    description="请核对 MX、Email Routing 规则、Worker Name、渠道配置和上游日志，然后重新测试。"
+                  />
+                ) : null}
                 <LayerCard>
-                  <LayerCard.Secondary>检查清单</LayerCard.Secondary>
+                  <LayerCard.Secondary>测试前检查</LayerCard.Secondary>
                   <LayerCard.Primary>
                     <div className="flex flex-col gap-2">
-                      <Text size="sm">
-                        1. 向 support@{savedDomain || domain || "客户域"}（或你配置的别名）发信
-                      </Text>
-                      <Text size="sm">2. 确认该地址已转发到 {inboundAddress || "入站地址"}</Text>
-                      <Text size="sm">
-                        3. 确认 Cloudflare Worker 日志有请求，且 Webhook 返回 2xx
-                      </Text>
-                      <Text size="sm">4. 打开本后台「邮件」列表，应能看到新记录</Text>
-                      <Text size="sm" variant="secondary">
-                        本地无真实邮件时，可用仓库脚本 scripts/simulate-inbound.sh 模拟 Worker 推送。
-                      </Text>
+                      <Text size="sm">1. SMTP 已启用并通过连接测试</Text>
+                      <Text size="sm">2. 当前收件渠道已完成上一页配置</Text>
+                      <Text size="sm">3. Worker 渠道的路由动作是 Send to a Worker</Text>
+                      <Text size="sm">4. Cloudflare 规则选择的 Worker Name 与本页完全一致</Text>
                     </div>
                   </LayerCard.Primary>
                 </LayerCard>
                 <div className="flex justify-between gap-2">
-                  <Button variant="ghost" onClick={() => setStep("worker")}>
+                  <Button variant="ghost" disabled={busyTesting} onClick={() => setStep("guide")}>
                     上一步
                   </Button>
-                  <Button
-                    icon={CheckCircleIcon}
-                    onClick={() => {
-                      toast.success("接入配置已完成", "若收不到信，请再核对转发与 Worker");
-                      closeWizard();
-                    }}
-                  >
-                    完成
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button
+                      loading={busyTesting}
+                      disabled={
+                        !isAdmin ||
+                        !smtp?.enabled ||
+                        !testRecipient.trim() ||
+                        !canManageSavedDomain
+                      }
+                      onClick={() => void runDomainTest()}
+                    >
+                      {testState === "success" ? "重新测试" : "发送并自动验证"}
+                    </Button>
+                    {testState === "success" ? (
+                      <Button
+                        icon={CheckCircleIcon}
+                        onClick={() => {
+                          setOpen(false);
+                          resetWizard();
+                        }}
+                      >
+                        完成
+                      </Button>
+                    ) : null}
+                  </div>
                 </div>
               </>
             ) : null}
