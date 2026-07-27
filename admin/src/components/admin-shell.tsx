@@ -251,8 +251,8 @@ export function AdminShell({ children }: { children: ReactNode }) {
         </Sidebar.Footer>
       </Sidebar>
 
-      <Surface as="main" className="min-h-screen flex-1">
-        <div className="mx-auto w-full max-w-6xl p-6 md:p-8">{children}</div>
+      <Surface as="main" className="min-h-screen min-w-0 flex-1 overflow-x-hidden">
+        <div className="mx-auto w-full min-w-0 max-w-6xl p-6 md:p-8">{children}</div>
       </Surface>
     </Sidebar.Provider>
   );

@@ -57,24 +57,26 @@ export function DataTable<T extends { id: string }>({
             description={emptyDescription || "没有可显示的记录"}
           />
         ) : (
-          <Table>
-            <Table.Header>
-              <Table.Row>
-                {columns.map((col) => (
-                  <Table.Head key={col.key}>{col.header}</Table.Head>
-                ))}
-              </Table.Row>
-            </Table.Header>
-            <Table.Body>
-              {safeRows.map((row) => (
-                <Table.Row key={row.id}>
+          <div className="max-w-full overflow-x-auto">
+            <Table>
+              <Table.Header>
+                <Table.Row>
                   {columns.map((col) => (
-                    <Table.Cell key={col.key}>{col.cell(row)}</Table.Cell>
+                    <Table.Head key={col.key}>{col.header}</Table.Head>
                   ))}
                 </Table.Row>
-              ))}
-            </Table.Body>
-          </Table>
+              </Table.Header>
+              <Table.Body>
+                {safeRows.map((row) => (
+                  <Table.Row key={row.id}>
+                    {columns.map((col) => (
+                      <Table.Cell key={col.key}>{col.cell(row)}</Table.Cell>
+                    ))}
+                  </Table.Row>
+                ))}
+              </Table.Body>
+            </Table>
+          </div>
         )}
       </LayerCard.Primary>
       <LayerCard.Secondary>
