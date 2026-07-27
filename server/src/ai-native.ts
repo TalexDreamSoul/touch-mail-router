@@ -11,6 +11,10 @@ import { Hono, type Context, type Next } from "hono";
 import type { AppDb, ApiKeyScope, User } from "./db.js";
 import { deriveDomainWebhookSecret } from "./crypto.js";
 import { buildWorkerSnippet } from "./worker-snippet.js";
+import {
+  buildDomainAutomationPrompt,
+  buildGeneralAutomationPrompt,
+} from "./agent-prompt.js";
 import type { AppConfig } from "./config.js";
 
 export type AiAuth = {
@@ -57,9 +61,10 @@ export function buildOpenApi(config: AppConfig) {
     openapi: "3.1.0",
     info: {
       title: "Touch Mail AI-Native API",
-      version: "0.4.0",
+      version: "0.5.0",
       description:
         "Machine-friendly API for agents and skills. Authenticate with personal API keys (dk_…). Scopes: read, write.",
+      "x-agent-prompt": buildGeneralAutomationPrompt(base),
     },
     servers: [{ url: base }],
     components: {
@@ -160,6 +165,14 @@ export function buildOpenApi(config: AppConfig) {
           responses: { "200": { description: "Configuration is usable" }, "502": { description: "Provider validation failed" } },
         },
       },
+      "/ai/v1/automation-prompt": {
+        get: {
+          security: [],
+          summary: "Get the Cloudflare/DNS/Worker automation prompt for AI agents",
+          tags: ["meta"],
+          responses: { "200": { description: "Prompt and operating policy" } },
+        },
+      },
       "/ai/v1/me": {
         get: {
           summary: "Current key owner profile",
@@ -205,6 +218,8 @@ export function buildOpenApi(config: AppConfig) {
       "/ai/v1/domains/{id}/setup-guide": {
         get: {
           summary: "Get interactive setup steps for a domain",
+          description: "Response includes agentPrompt with exact DNS, Worker, Email Routing, and Rule instructions.",
+          "x-agent-prompt": buildGeneralAutomationPrompt(base),
           tags: ["domains"],
           parameters: [
             { name: "id", in: "path", required: true, schema: { type: "string" } },
@@ -295,7 +310,7 @@ export function buildSkillManifest(config: AppConfig) {
   const base = config.PUBLIC_URL.replace(/\/$/, "");
   return {
     name: "touch-mail-router",
-    version: "0.4.0",
+    version: "0.5.0",
     description:
       "Inbound email gateway: Cloudflare Email Worker → HTTPS API. Manage domains, list mails, create temp mailboxes (DuckMail-compatible).",
     homepage: base,
@@ -314,6 +329,7 @@ export function buildSkillManifest(config: AppConfig) {
     endpoints: {
       openapi: `${base}/ai/v1/openapi.json`,
       skill: `${base}/ai/v1/skill`,
+      automation_prompt: `${base}/ai/v1/automation-prompt`,
       me: `${base}/ai/v1/me`,
       domains: `${base}/ai/v1/domains`,
       domain_setup_guide: `${base}/ai/v1/domains/{id}/setup-guide`,
@@ -325,6 +341,7 @@ export function buildSkillManifest(config: AppConfig) {
       duckmail_token: `${base}/token`,
       duckmail_messages: `${base}/messages`,
     },
+    agent_prompt: buildGeneralAutomationPrompt(base),
     agent_instructions: [
       "Prefer /ai/v1/* for structured ok/error envelopes.",
       "Always send Authorization: Bearer dk_… from the user personal API keys page.",
@@ -332,7 +349,7 @@ export function buildSkillManifest(config: AppConfig) {
       "Each domain must bind one administrator-enabled receive channel.",
       "Use /ai/v1/domains/{id}/setup-guide for exact interactive Worker or forwarding steps.",
       "Email forwarding is followed by either DoneMail API collection or signed Webhook collection.",
-      "For Cloudflare catch-all, never type * into Custom address; edit Catch-all address instead.",,
+      "For Cloudflare catch-all, never type * into Custom address; edit Catch-all address instead.",
       "For temporary mailboxes use DuckMail-compatible /accounts + /token + /messages.",
       "After each call, history is recorded under /ai/v1/history for the key owner.",
     ],
@@ -438,6 +455,16 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
       });
       return {
         ...common,
+        agentPrompt: buildDomainAutomationPrompt({
+          baseUrl: config.PUBLIC_URL,
+          domainId: domain.id,
+          domain: domain.domain,
+          channelType: channel.type,
+          channelName: channel.name,
+          scope,
+          address: scope === "specific" ? address : undefined,
+          workerName: domain.workerName,
+        }),
         steps: [
           {
             id: "worker-create",
@@ -486,8 +513,20 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
     }
 
     if (channel.type === "email_forward") {
+      const forwardingTarget = db.renderForwardingAddress(domain, user.tenant) || "";
       return {
         ...common,
+        agentPrompt: buildDomainAutomationPrompt({
+          baseUrl: config.PUBLIC_URL,
+          domainId: domain.id,
+          domain: domain.domain,
+          channelType: channel.type,
+          channelName: channel.name,
+          collectorType: channel.collectorType,
+          scope,
+          address: scope === "specific" ? address : undefined,
+          forwardingTarget,
+        }),
         steps: [
           {
             id: "forward",
@@ -501,7 +540,7 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
               { name: "Action", value: "Forward" },
               {
                 name: "Target",
-                value: db.renderForwardingAddress(domain, user.tenant) || "",
+                value: forwardingTarget,
                 copyable: true,
               },
             ],
@@ -515,7 +554,19 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
       };
     }
 
-    return { ...common, steps: [{ id: "collector", title: "Use administrator-managed collector" }] };
+    return {
+      ...common,
+      agentPrompt: buildDomainAutomationPrompt({
+        baseUrl: config.PUBLIC_URL,
+        domainId: domain.id,
+        domain: domain.domain,
+        channelType: channel.type,
+        channelName: channel.name,
+        scope,
+        address: scope === "specific" ? address : undefined,
+      }),
+      steps: [{ id: "collector", title: "Use administrator-managed collector" }],
+    };
   }
 
   async function withHistory(
@@ -556,10 +607,18 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
   // Public meta (no auth)
   app.get("/ai/v1/openapi.json", (c) => c.json(buildOpenApi(config)));
   app.get("/ai/v1/skill", (c) => c.json(buildSkillManifest(config)));
+  app.get("/ai/v1/automation-prompt", (c) =>
+    ok(c, {
+      agentPrompt: buildGeneralAutomationPrompt(config.PUBLIC_URL),
+      purpose: "Cloudflare DNS, Email Routing, Worker, Rules, verification, and rollback automation",
+    }),
+  );
   app.get("/ai/v1/docs", (c) =>
     ok(c, {
       openapi: "/ai/v1/openapi.json",
       skill: "/ai/v1/skill",
+      automationPrompt: "/ai/v1/automation-prompt",
+      agentPrompt: buildGeneralAutomationPrompt(config.PUBLIC_URL),
       auth: "Authorization: Bearer dk_…",
       scopes: ["read", "write"],
     }),
@@ -572,7 +631,8 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
     if (
       p === "/ai/v1/openapi.json" ||
       p === "/ai/v1/skill" ||
-      p === "/ai/v1/docs"
+      p === "/ai/v1/docs" ||
+      p === "/ai/v1/automation-prompt"
     ) {
       return next();
     }
@@ -600,6 +660,7 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
   app.get("/ai/v1/inbound", requireScope("read"), async (c) =>
     withHistory(c, async () => {
       return ok(c, {
+        agentPrompt: buildGeneralAutomationPrompt(config.PUBLIC_URL),
         receiveChannels: db.listReceiveChannelsPublic(false).map((channel) => ({
           ...channel,
           adminKey: "",

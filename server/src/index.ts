@@ -22,6 +22,10 @@ import {
 import { parseRawEmail } from "./parse.js";
 import { buildWorkerSnippet } from "./worker-snippet.js";
 import {
+  buildDomainAutomationPrompt,
+  buildGeneralAutomationPrompt,
+} from "./agent-prompt.js";
+import {
   ingestApiMail,
   startDoneMailScheduler,
   syncDoneMailChannel,
@@ -767,6 +771,7 @@ app.get("/api/me/api-docs", requireUser, (c) => {
       history: `${base}/ai/v1/history`,
       skill: `${base}/ai/v1/skill`,
       openapi: `${base}/ai/v1/openapi.json`,
+      automationPrompt: `${base}/ai/v1/automation-prompt`,
     },
     duckmail: {
       domains: `${base}/domains`,
@@ -857,6 +862,16 @@ app.get("/api/domains/:id/setup-guide", requireUser, (c) => {
       channel: { id: channel.id, name: channel.name, type: channel.type },
       scope,
       testRecipient,
+      agentPrompt: buildDomainAutomationPrompt({
+        baseUrl: config.PUBLIC_URL,
+        domainId: domain.id,
+        domain: domain.domain,
+        channelType: channel.type,
+        channelName: channel.name,
+        scope,
+        address: scope === "specific" ? address : undefined,
+        workerName: domain.workerName,
+      }),
       steps: [
         {
           id: "worker-create",
@@ -925,6 +940,17 @@ app.get("/api/domains/:id/setup-guide", requireUser, (c) => {
       },
       scope,
       testRecipient,
+      agentPrompt: buildDomainAutomationPrompt({
+        baseUrl: config.PUBLIC_URL,
+        domainId: domain.id,
+        domain: domain.domain,
+        channelType: channel.type,
+        channelName: channel.name,
+        collectorType: channel.collectorType,
+        scope,
+        address: scope === "specific" ? address : undefined,
+        forwardingTarget: target,
+      }),
       steps: [
         {
           id: "forward-scope",
@@ -958,6 +984,15 @@ app.get("/api/domains/:id/setup-guide", requireUser, (c) => {
     channel: { id: channel.id, name: channel.name, type: channel.type },
     scope,
     testRecipient,
+    agentPrompt: buildDomainAutomationPrompt({
+      baseUrl: config.PUBLIC_URL,
+      domainId: domain.id,
+      domain: domain.domain,
+      channelType: channel.type,
+      channelName: channel.name,
+      scope,
+      address: scope === "specific" ? address : undefined,
+    }),
     steps: [{ id: "collector", title: "按管理员配置的收集方式接入" }],
   });
 });
@@ -1277,6 +1312,7 @@ app.get("/api/admin/receive-channels/:id/setup-guide", requireAdmin, (c) => {
   if (!channel) return c.json({ error: "未找到收件渠道" }, 404);
   const impact = db.getReceiveChannelImpact(channel.id);
   const publicUrl = config.PUBLIC_URL.replace(/\/$/, "");
+  const agentPrompt = buildGeneralAutomationPrompt(config.PUBLIC_URL);
 
   if (channel.type === "email_forward") {
     const collector =
@@ -1317,6 +1353,7 @@ app.get("/api/admin/receive-channels/:id/setup-guide", requireAdmin, (c) => {
     return c.json({
       channel: db.getReceiveChannelPublic(channel.id),
       impact,
+      agentPrompt,
       forwarding: {
         template: channel.forwardingAddressTemplate,
         requiredVariables: ["tenant"],
@@ -1330,6 +1367,7 @@ app.get("/api/admin/receive-channels/:id/setup-guide", requireAdmin, (c) => {
     return c.json({
       channel: db.getReceiveChannelPublic(channel.id),
       impact,
+      agentPrompt,
       instructions: [
         "每个域名使用独立 Worker、Worker Name 和派生 Secret",
         "域名用户通过 GET /api/domains/:id/setup-guide 获取完整步骤",
@@ -1340,6 +1378,7 @@ app.get("/api/admin/receive-channels/:id/setup-guide", requireAdmin, (c) => {
   return c.json({
     channel: db.getReceiveChannelPublic(channel.id),
     impact,
+    agentPrompt,
     endpoint:
       channel.type === "api_push" ? `${publicUrl}/v1/inbound/json/${channel.id}` : undefined,
   });

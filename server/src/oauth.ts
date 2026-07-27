@@ -38,13 +38,9 @@ export function unsealOAuthState(
 ): OAuthCookieState | null {
   const [payload, encodedSignature, ...extra] = token.split(".");
   if (!payload || !encodedSignature || extra.length) return null;
-  const expected = createHmac("sha256", secret).update(payload).digest();
-  let provided: Buffer;
-  try {
-    provided = Buffer.from(encodedSignature, "base64url");
-  } catch {
-    return null;
-  }
+  const expectedSignature = createHmac("sha256", secret).update(payload).digest("base64url");
+  const expected = Buffer.from(expectedSignature, "utf8");
+  const provided = Buffer.from(encodedSignature, "utf8");
   if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) return null;
   try {
     const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as OAuthCookieState;

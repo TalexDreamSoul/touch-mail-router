@@ -28,12 +28,14 @@ Create keys in Admin → **个人 → API Keys**. Scopes:
 |-----|---------|
 | `GET /ai/v1/skill` | This skill as JSON (base URL + examples) |
 | `GET /ai/v1/openapi.json` | OpenAPI 3.1 |
-| `GET /ai/v1/docs` | Short docs envelope |
+| `GET /ai/v1/docs` | Short docs envelope + `agentPrompt` |
+| `GET /ai/v1/automation-prompt` | No-root Cloudflare/DNS/Worker automation prompt |
 
 ## Primary endpoints (Bearer required)
 
 ```text
 GET  /ai/v1/me
+GET  /ai/v1/automation-prompt
 GET  /ai/v1/inbound
 GET  /ai/v1/domains?q=&page=&pageSize=
 POST /ai/v1/domains          # write — body: { domain, note?, visibility? }
@@ -62,7 +64,21 @@ Customer domain
   → Admin / AI list mails
 ```
 
-Registering a domain in the API is a **ledger** only. Call `GET /ai/v1/domains/:id/setup-guide` to obtain the channel-specific steps and exact values. For `scope=all`, never type `*` in Cloudflare Custom address; edit **Catch-all address** instead. Email forwarding users never receive administrator collector credentials.
+Registering a domain in the API is a **ledger** only. Call `GET /ai/v1/domains/:id/setup-guide` to obtain the channel-specific steps, exact values, and `guide.agentPrompt`. For `scope=all`, never type `*` in Cloudflare Custom address; edit **Catch-all address** instead. Email forwarding users never receive administrator collector credentials.
+
+## AI automation contract
+
+When the user delegates setup to an AI agent:
+
+1. Load `/ai/v1/automation-prompt`, then the domain setup guide. Treat returned values as authoritative.
+2. Prefer an already-authorized Cloudflare MCP/API. Use `npx wrangler` for Worker deployment and secrets without global installation, `sudo`, or root.
+3. Read and snapshot Zone, DNS, Email Routing, Workers, and Rules before any mutation.
+4. Let Cloudflare's current Email Routing API/MCP generate or validate MX/TXT records; never invent MX records from memory.
+5. Preserve unrelated DNS. Ask for explicit approval before replacing MX, deleting Rules/Workers, or expanding to Catch-all.
+6. For Catch-all, edit **Catch-all address** and choose **Send to a Worker**. For a specific address, Custom address contains only the local-part.
+7. Never print or persist `WEBHOOK_SECRET` or Cloudflare tokens. Use secret APIs or `npx wrangler secret put`.
+8. Read back every changed resource and run the Touch Mail end-to-end domain test before claiming completion.
+9. Report changed resource IDs, verification evidence, remaining work, and rollback steps.
 
 ## DuckMail-compatible (optional)
 

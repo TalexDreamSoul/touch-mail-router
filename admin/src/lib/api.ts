@@ -59,6 +59,7 @@ export type DomainSetupGuide = {
   };
   scope: "all" | "specific";
   testRecipient: string;
+  agentPrompt: string;
   steps: Array<{
     id: string;
     title: string;

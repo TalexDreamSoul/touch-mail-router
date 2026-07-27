@@ -164,6 +164,17 @@ curl "$PUBLIC_URL/messages" -H "Authorization: Bearer <token>"
 
 创建账户时 `address` 的 local-part 会作为入站 `tenant`，Worker 推送到 `{local}@INBOUND_DOMAIN` 即可进该邮箱。
 
+### AI 自动接入 API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/ai/v1/automation-prompt` | 通用 Cloudflare DNS、Email Routing、Worker、Rules 自动化 Prompt |
+| `GET` | `/ai/v1/skill` | AI/MCP Skill manifest，包含 `agent_prompt` 与能力入口 |
+| `GET` | `/ai/v1/openapi.json` | OpenAPI 3.1；`info.x-agent-prompt` 提供通用执行策略 |
+| `GET` | `/ai/v1/domains/:id/setup-guide` | 返回结构化步骤和注入真实域名、渠道、范围、Worker Name 的 `guide.agentPrompt` |
+
+Prompt 要求 AI 优先使用已授权的 Cloudflare MCP/API；Worker 可通过无 Root 的 `npx wrangler` 部署。AI 必须先读取现状、保留无关 DNS、在破坏性变更前获得确认，并在结束前执行端到端测试。DNS 和 Email Routing 不使用模型记忆中的固定 MX，而通过 Cloudflare 当前 API/MCP 能力生成或校验。
+
 ### 管理后台 API（内部）
 
 | 方法 | 路径 | 说明 |

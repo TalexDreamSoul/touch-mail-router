@@ -19,6 +19,7 @@ import {
   BookOpenIcon,
   CheckCircleIcon,
   PlusIcon,
+  RobotIcon,
   TrashIcon,
 } from "@phosphor-icons/react";
 import { AdminShell } from "@/components/admin-shell";
@@ -668,6 +669,26 @@ export default function DomainsPage() {
                       title={currentGuideStep.title}
                       description={`步骤 ${guideStepIndex + 1} / ${guide?.steps.length || 1}，完成本页操作后再继续。`}
                     />
+                    {guideStepIndex === 0 && guide?.agentPrompt ? (
+                      <LayerCard>
+                        <LayerCard.Secondary>AI 自动接入</LayerCard.Secondary>
+                        <LayerCard.Primary>
+                          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                            <Text size="sm" variant="secondary">
+                              已包含当前域名、Worker、DNS、Email Routing、Rules、验证与回滚要求。
+                            </Text>
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              icon={RobotIcon}
+                              onClick={() => void copyCode(guide.agentPrompt, "AI 接入 Prompt")}
+                            >
+                              复制 AI Prompt
+                            </Button>
+                          </div>
+                        </LayerCard.Primary>
+                      </LayerCard>
+                    ) : null}
                     {currentGuideStep.warning ? (
                       <Banner
                         variant="alert"
