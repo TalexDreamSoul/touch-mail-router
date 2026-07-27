@@ -23,6 +23,7 @@ import { PageHeader } from "@/components/page-header";
 import {
   api,
   formatDate,
+  type EmailForwardCollectorType,
   type ReceiveChannel,
   type ReceiveChannelType,
 } from "@/lib/api";
@@ -40,6 +41,7 @@ const emptyForm = {
   name: "",
   description: "",
   type: "worker" as ReceiveChannelType,
+  collectorType: "webhook" as EmailForwardCollectorType,
   enabled: true,
   forwardingAddressTemplate: "{tenant}@inbound.example.com",
   baseUrl: "",
@@ -60,6 +62,9 @@ export default function ReceiveChannelsPage() {
   const [saving, setSaving] = useState(false);
   const [createdSecret, setCreatedSecret] = useState("");
   const [createdChannelId, setCreatedChannelId] = useState("");
+  const [createdChannelType, setCreatedChannelType] = useState<ReceiveChannelType | "">("");
+  const [createdCollectorType, setCreatedCollectorType] =
+    useState<EmailForwardCollectorType | "">("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -89,6 +94,8 @@ export default function ReceiveChannelsPage() {
             name: channel.name,
             description: channel.description,
             type: channel.type,
+            collectorType:
+              channel.collectorType === "donemail" ? "donemail" : "webhook",
             enabled: channel.enabled,
             forwardingAddressTemplate:
               channel.forwardingAddressTemplate || "{tenant}@inbound.example.com",
@@ -106,13 +113,54 @@ export default function ReceiveChannelsPage() {
     setSaving(true);
     try {
       if (editingId) {
-        await api.updateReceiveChannel(editingId, form);
+        const { impact } = await api.receiveChannelImpact(editingId);
+        const domainPreview = impact.domains.slice(0, 8).map((item) => item.domain).join("\n");
+        const more = Math.max(0, impact.domainCount - 8);
+        const confirmed = confirm(
+          [
+            `确认修改收件渠道“${form.name}”？`,
+            "",
+            `将影响 ${impact.userCount} 个用户、${impact.domainCount} 个域名。`,
+            domainPreview,
+            more ? `以及另外 ${more} 个域名` : "",
+            "",
+            "修改收集方式、目标模板或凭据可能导致这些域名停止收件。",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+        if (!confirmed) return;
+        const result = await api.updateReceiveChannel(editingId, {
+          ...form,
+          confirmImpact: true,
+        });
+        if (result.pushToken) {
+          setCreatedSecret(result.pushToken);
+          setCreatedChannelId(result.channel.id);
+          setCreatedChannelType(result.channel.type);
+          setCreatedCollectorType(
+            result.channel.collectorType === "donemail" ? "donemail" : "webhook",
+          );
+        } else {
+          setCreatedSecret("");
+          setCreatedChannelId("");
+          setCreatedChannelType("");
+          setCreatedCollectorType("");
+        }
         toast.success("收件渠道已更新");
       } else {
+        setCreatedSecret("");
+        setCreatedChannelId("");
+        setCreatedChannelType("");
+        setCreatedCollectorType("");
         const result = await api.createReceiveChannel(form);
         if (result.pushToken) {
           setCreatedSecret(result.pushToken);
           setCreatedChannelId(result.channel.id);
+          setCreatedChannelType(result.channel.type);
+          setCreatedCollectorType(
+            result.channel.collectorType === "donemail" ? "donemail" : "webhook",
+          );
         }
         toast.success("收件渠道已创建");
       }
@@ -158,7 +206,10 @@ export default function ReceiveChannelsPage() {
       cell: (row) => (
         <div className="flex flex-col gap-1">
           <Text size="sm" variant="secondary">
-            {row.type === "donemail" ? formatDate(row.lastSyncAt) : "—"}
+            {row.type === "donemail" ||
+            (row.type === "email_forward" && row.collectorType === "donemail")
+              ? formatDate(row.lastSyncAt)
+              : "—"}
           </Text>
           {row.lastSyncError ? (
             <Text size="xs" variant="error">
@@ -188,7 +239,8 @@ export default function ReceiveChannelsPage() {
           >
             测试
           </Button>
-          {row.type === "donemail" ? (
+          {row.type === "donemail" ||
+          (row.type === "email_forward" && row.collectorType === "donemail") ? (
             <Button
               size="sm"
               variant="secondary"
@@ -216,8 +268,16 @@ export default function ReceiveChannelsPage() {
             variant="destructive"
             icon={TrashIcon}
             onClick={async () => {
-              if (!confirm(`删除收件渠道 ${row.name}？`)) return;
               try {
+                const { impact } = await api.receiveChannelImpact(row.id);
+                if (impact.domainCount > 0) {
+                  toast.error(
+                    "不能删除正在使用的渠道",
+                    `仍绑定 ${impact.userCount} 个用户、${impact.domainCount} 个域名，请先迁移域名。`,
+                  );
+                  return;
+                }
+                if (!confirm(`确认删除收件渠道“${row.name}”？当前没有绑定域名。`)) return;
                 await api.deleteReceiveChannel(row.id);
                 toast.success("已删除");
                 void load();
@@ -247,16 +307,29 @@ export default function ReceiveChannelsPage() {
       <Banner
         className="mb-4"
         variant="secondary"
-        title="Worker 与邮箱转发是不同渠道"
-        description="Worker 使用 Cloudflare Email Routing 的 Send to a Worker；邮箱转发才会把原邮箱转到管理员配置的目标地址。"
+        title="邮箱转发需要选择后续收集方式"
+        description="链路为：业务邮箱转发到中转地址，再由 DoneMail API 定时拉取或接收 Worker 通过 Webhook 推送。域名用户只配置转发，不接触管理员凭据。"
       />
       {createdSecret ? (
         <LayerCard className="mb-4">
-          <LayerCard.Secondary>渠道签名 Token（仅本次显示）</LayerCard.Secondary>
+          <LayerCard.Secondary>
+            {createdChannelType === "email_forward"
+              ? "接收 Worker 部署凭据（仅管理员使用，仅本次显示）"
+              : "API 推送凭据（仅本次显示）"}
+          </LayerCard.Secondary>
           <LayerCard.Primary>
             <div className="flex flex-col gap-3">
+              {createdChannelType === "email_forward" && createdCollectorType === "webhook" ? (
+                <Banner
+                  variant="alert"
+                  title="不要把这些值交给域名用户或填写到邮箱转发设置"
+                  description="它们只用于管理员部署的共享接收 Worker，对推送到 Touch Mail 的原始邮件进行鉴权。"
+                />
+              ) : null}
               <div>
-                <Text size="xs" variant="secondary">收件渠道 ID</Text>
+                <Text size="xs" variant="secondary">
+                  {createdChannelType === "email_forward" ? "RECEIVE_CHANNEL_ID" : "Channel ID"}
+                </Text>
                 <ClipboardText
                   text={createdChannelId}
                   size="base"
@@ -265,12 +338,14 @@ export default function ReceiveChannelsPage() {
                 />
               </div>
               <div>
-                <Text size="xs" variant="secondary">签名 Token</Text>
+                <Text size="xs" variant="secondary">
+                  {createdChannelType === "email_forward" ? "WEBHOOK_SECRET" : "API Token"}
+                </Text>
                 <ClipboardText
                   text={createdSecret}
                   size="base"
                   tooltip={{ text: "复制", copiedText: "已复制" }}
-                  labels={{ copyAction: "复制渠道 Token" }}
+                  labels={{ copyAction: "复制鉴权 Token" }}
                 />
               </div>
             </div>
@@ -310,13 +385,16 @@ export default function ReceiveChannelsPage() {
               label="渠道类型"
               hideLabel={false}
               value={form.type}
-              onValueChange={(value) =>
-                setForm({ ...form, type: String(value) as ReceiveChannelType })
-              }
+              onValueChange={(value) => {
+                const type = String(value) as ReceiveChannelType;
+                setForm({ ...form, type, collectorType: "webhook" });
+              }}
             >
-              <Select.Option value="worker">Cloudflare Worker</Select.Option>
-              <Select.Option value="email_forward">邮箱转发</Select.Option>
-              <Select.Option value="donemail">DoneMail API</Select.Option>
+              <Select.Option value="worker">Cloudflare Worker（每域直连）</Select.Option>
+              <Select.Option value="email_forward">邮箱转发（DoneMail / Webhook 收集）</Select.Option>
+              {form.type === "donemail" ? (
+                <Select.Option value="donemail">DoneMail API（旧版直连，仅兼容）</Select.Option>
+              ) : null}
               <Select.Option value="api_push">API 主动上报</Select.Option>
             </Select>
             <Switch
@@ -333,24 +411,54 @@ export default function ReceiveChannelsPage() {
               />
             ) : null}
             {form.type === "email_forward" ? (
-              <Input
-                label="转发目标模板"
-                description="必须包含 {tenant}；可选 {domain}。用户会看到渲染后的具体地址。"
-                value={form.forwardingAddressTemplate}
-                onChange={(event) =>
-                  setForm({ ...form, forwardingAddressTemplate: event.target.value })
-                }
-                placeholder="{tenant}@inbound.example.com"
-              />
-            ) : null}
-            {form.type === "donemail" ? (
               <>
                 <Input
+                  label="转发目标模板"
+                  description="必须包含 {tenant}；可选 {domain}。域名用户只会看到渲染后的目标地址。"
+                  value={form.forwardingAddressTemplate}
+                  onChange={(event) =>
+                    setForm({ ...form, forwardingAddressTemplate: event.target.value })
+                  }
+                  placeholder="{tenant}@inbound.example.com"
+                />
+                <Select
+                  label="转发后的收集方式"
+                  description="邮件到达中转地址后，Touch Mail 如何取得原始邮件"
+                  hideLabel={false}
+                  value={form.collectorType}
+                  onValueChange={(value) =>
+                    setForm({
+                      ...form,
+                      collectorType: value === "donemail" ? "donemail" : "webhook",
+                    })
+                  }
+                >
+                  <Select.Option value="donemail">DoneMail API 定时拉取</Select.Option>
+                  <Select.Option value="webhook">接收 Worker Webhook 推送</Select.Option>
+                </Select>
+                {form.collectorType === "webhook" ? (
+                  <Banner
+                    variant="secondary"
+                    title="管理员需要部署共享接收 Worker"
+                    description="创建后系统仅显示一次 RECEIVE_CHANNEL_ID 和 WEBHOOK_SECRET。域名用户及邮箱服务商不需要这些凭据。"
+                  />
+                ) : null}
+              </>
+            ) : null}
+            {form.type === "donemail" ||
+            (form.type === "email_forward" && form.collectorType === "donemail") ? (
+              <>
+                <Banner
+                  variant="secondary"
+                  title="DoneMail 收集中转邮件"
+                  description="转发目标域名必须由该 DoneMail 实例接收；Touch Mail 将定时读取 /api/mails 和附件。"
+                />
+                <Input
                   label="DoneMail Base URL"
-                  description="填写站点根地址，不要填写 /api/overview 文档地址。"
+                  description="填写站点根地址，不要填写具体 API 路径。"
                   value={form.baseUrl}
                   onChange={(event) => setForm({ ...form, baseUrl: event.target.value })}
-                  placeholder="https://sow.us.kg"
+                  placeholder="https://done.example.com"
                 />
                 <SensitiveInput
                   label="X-Admin-Key"

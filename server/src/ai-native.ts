@@ -9,6 +9,8 @@
  */
 import { Hono, type Context, type Next } from "hono";
 import type { AppDb, ApiKeyScope, User } from "./db.js";
+import { deriveDomainWebhookSecret } from "./crypto.js";
+import { buildWorkerSnippet } from "./worker-snippet.js";
 import type { AppConfig } from "./config.js";
 
 export type AiAuth = {
@@ -121,6 +123,22 @@ export function buildOpenApi(config: AppConfig) {
           responses: { "201": { description: "Created" } },
         },
       },
+      "/ai/v1/domains/{id}/setup-guide": {
+        get: {
+          summary: "Get interactive setup steps for a domain",
+          tags: ["domains"],
+          parameters: [
+            { name: "id", in: "path", required: true, schema: { type: "string" } },
+            { name: "scope", in: "query", schema: { type: "string", enum: ["all", "specific"] } },
+            { name: "address", in: "query", schema: { type: "string" } },
+          ],
+          responses: {
+            "200": { description: "Channel-aware setup steps and exact field values" },
+            "400": { description: "Invalid scope/address or channel configuration" },
+            "404": { description: "Domain not found" },
+          },
+        },
+      },
       "/ai/v1/mails": {
         get: {
           summary: "List inbound mails for tenant",
@@ -219,6 +237,7 @@ export function buildSkillManifest(config: AppConfig) {
       skill: `${base}/ai/v1/skill`,
       me: `${base}/ai/v1/me`,
       domains: `${base}/ai/v1/domains`,
+      domain_setup_guide: `${base}/ai/v1/domains/{id}/setup-guide`,
       mails: `${base}/ai/v1/mails`,
       inbound: `${base}/ai/v1/inbound`,
       history: `${base}/ai/v1/history`,
@@ -232,7 +251,9 @@ export function buildSkillManifest(config: AppConfig) {
       "Always send Authorization: Bearer dk_… from the user personal API keys page.",
       "write scope required for POST/PATCH/DELETE; read is enough for GET.",
       "Each domain must bind one administrator-enabled receive channel.",
-      "Worker channels use Cloudflare Email Routing → Send to a Worker; email forwarding is a separate channel type.",
+      "Use /ai/v1/domains/{id}/setup-guide for exact interactive Worker or forwarding steps.",
+      "Email forwarding is followed by either DoneMail API collection or signed Webhook collection.",
+      "For Cloudflare catch-all, never type * into Custom address; edit Catch-all address instead.",,
       "For temporary mailboxes use DuckMail-compatible /accounts + /token + /messages.",
       "After each call, history is recorded under /ai/v1/history for the key owner.",
     ],
@@ -292,6 +313,130 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
       }
       await next();
     };
+  }
+
+  function domainSetupGuide(
+    user: User,
+    domainId: string,
+    requestedScope: string,
+    requestedAddress: string,
+  ): Record<string, unknown> {
+    const domain = db.listDomains(user.id).find((item) => item.id === domainId);
+    if (!domain) throw Object.assign(new Error("domain not found"), { status: 404 });
+    const channel = db.getReceiveChannel(domain.receiveChannelId);
+    if (!channel || !channel.enabled) throw new Error("domain is not bound to an enabled receive channel");
+    const scope = requestedScope === "specific" ? "specific" : "all";
+    const address = requestedAddress.trim().toLowerCase();
+    const parts = address.split("@");
+    if (
+      scope === "specific" &&
+      !(parts.length === 2 && Boolean(parts[0]) && parts[1] === domain.domain)
+    ) {
+      throw new Error(`specific address must belong to ${domain.domain}`);
+    }
+    const common = {
+      domainId: domain.id,
+      domain: domain.domain,
+      channel: {
+        id: channel.id,
+        name: channel.name,
+        type: channel.type,
+        collectorType: channel.collectorType || undefined,
+      },
+      scope,
+      testRecipient: scope === "specific" ? address : `test@${domain.domain}`,
+    };
+
+    if (channel.type === "worker") {
+      if (!domain.workerName) throw new Error("Worker Name is not configured");
+      const webhookUrl = `${config.PUBLIC_URL.replace(/\/$/, "")}/v1/inbound`;
+      const webhookSecret = deriveDomainWebhookSecret(config.WEBHOOK_SECRET, domain.id);
+      const snippet = buildWorkerSnippet({
+        webhookUrl,
+        webhookSecret,
+        domain: domain.domain,
+        workerName: domain.workerName,
+      });
+      return {
+        ...common,
+        steps: [
+          {
+            id: "worker-create",
+            title: "Create and deploy Worker",
+            fields: [{ name: "Worker Name", value: domain.workerName, copyable: true }],
+            instructions: [
+              "Cloudflare > Workers & Pages > Create Worker",
+              "Use the exact Worker Name",
+              "Replace the default code and deploy",
+            ],
+            code: { javascript: snippet.js, wranglerToml: snippet.wranglerToml },
+          },
+          {
+            id: "worker-variables",
+            title: "Configure Worker variables",
+            fields: [
+              { name: "WEBHOOK_URL", value: webhookUrl, kind: "text", copyable: true },
+              { name: "WEBHOOK_SECRET", value: webhookSecret, kind: "secret", copyable: true },
+              { name: "EMAIL_DOMAIN", value: domain.domain, kind: "text", copyable: true },
+            ],
+            instructions: ["Worker > Settings > Variables and Secrets", "Save and redeploy"],
+          },
+          {
+            id: "email-routing",
+            title: scope === "all" ? "Configure Catch-all route" : "Configure specific address route",
+            warning:
+              scope === "all"
+                ? "Do not enter *, *@domain, or any value in Custom address. Edit Catch-all address."
+                : undefined,
+            fields:
+              scope === "all"
+                ? [
+                    { name: "Rule", value: "Catch-all address" },
+                    { name: "Custom address", value: "leave empty" },
+                    { name: "Action", value: "Send to a Worker" },
+                    { name: "Worker", value: domain.workerName, copyable: true },
+                  ]
+                : [
+                    { name: "Custom address", value: parts[0], copyable: true },
+                    { name: "Action", value: "Send to a Worker" },
+                    { name: "Worker", value: domain.workerName, copyable: true },
+                  ],
+          },
+        ],
+      };
+    }
+
+    if (channel.type === "email_forward") {
+      return {
+        ...common,
+        steps: [
+          {
+            id: "forward",
+            title: scope === "all" ? "Configure domain-wide forwarding" : "Configure mailbox forwarding",
+            warning:
+              scope === "all"
+                ? "Provider must support Catch-all/domain forwarding. Do not use * as a mailbox address."
+                : undefined,
+            fields: [
+              { name: "Source", value: scope === "all" ? `*@${domain.domain} / Catch-all` : address },
+              { name: "Action", value: "Forward" },
+              {
+                name: "Target",
+                value: db.renderForwardingAddress(domain, user.tenant) || "",
+                copyable: true,
+              },
+            ],
+          },
+          {
+            id: "collector",
+            title: channel.collectorType === "donemail" ? "DoneMail API collection" : "Signed Webhook collection",
+            instructions: ["Collector credentials are managed by administrators and are never entered by domain users."],
+          },
+        ],
+      };
+    }
+
+    return { ...common, steps: [{ id: "collector", title: "Use administrator-managed collector" }] };
   }
 
   async function withHistory(
@@ -387,7 +532,8 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
         notes: [
           "Bind every domain to one enabled receive channel.",
           "Worker: configure Cloudflare Email Routing action Send to a Worker; no email forwarding is required.",
-          "Email forward, DoneMail pull, and generic API push are separate channel types.",
+          "Email forwarding is collected by either DoneMail API polling or a signed Webhook Worker.",
+          "Use /ai/v1/domains/{id}/setup-guide for exact route and forwarding fields.",
         ],
       });
     }),
@@ -447,6 +593,25 @@ export function createAiNativeApp(db: AppDb, config: AppConfig) {
         return ok(c, { domain }, 201);
       } catch (e) {
         return err(c, 400, e instanceof Error ? e.message : "create failed");
+      }
+    }),
+  );
+
+  app.get("/ai/v1/domains/:id/setup-guide", requireScope("read"), async (c) =>
+    withHistory(c, async () => {
+      const ai = c.get("ai");
+      try {
+        return ok(c, {
+          guide: domainSetupGuide(
+            ai.user,
+            c.req.param("id") || "",
+            c.req.query("scope") || "all",
+            c.req.query("address") || "",
+          ),
+        });
+      } catch (error) {
+        const status = Number((error as { status?: number }).status || 400);
+        return err(c, status, error instanceof Error ? error.message : "setup guide failed");
       }
     }),
   );

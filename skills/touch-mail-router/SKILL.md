@@ -37,6 +37,7 @@ GET  /ai/v1/me
 GET  /ai/v1/inbound
 GET  /ai/v1/domains?q=&page=&pageSize=
 POST /ai/v1/domains          # write — body: { domain, note?, visibility? }
+GET  /ai/v1/domains/:id/setup-guide?scope=all|specific&address=  # exact interactive steps
 GET  /ai/v1/mails?q=&page=&pageSize=
 GET  /ai/v1/mails/:id
 GET  /ai/v1/history?q=&page=&pageSize=
@@ -52,15 +53,16 @@ Envelope:
 ## Mental model
 
 ```text
-Customer mailbox
-  → forward to {tenant}@{INBOUND_DOMAIN}
-  → Cloudflare Email Routing + Worker
-  → POST /v1/inbound (HMAC)
-  → API storage
+Customer domain
+  ├─ direct Worker: Cloudflare Email Routing → per-domain Worker
+  └─ email forwarding: business mailbox → forwarding target
+       ├─ DoneMail API polling
+       └─ signed shared Worker Webhook
+  → Touch Mail storage
   → Admin / AI list mails
 ```
 
-Registering a domain in the API is a **ledger** only. Mail still needs forward + Worker.
+Registering a domain in the API is a **ledger** only. Call `GET /ai/v1/domains/:id/setup-guide` to obtain the channel-specific steps and exact values. For `scope=all`, never type `*` in Cloudflare Custom address; edit **Catch-all address** instead. Email forwarding users never receive administrator collector credentials.
 
 ## DuckMail-compatible (optional)
 

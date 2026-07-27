@@ -174,7 +174,8 @@ curl "$PUBLIC_URL/messages" -H "Authorization: Bearer <token>"
 | `POST` | `/api/auth/login` | 登录 |
 | `GET/POST/PATCH/DELETE` | `/api/domains*` | 域名与收件渠道绑定 |
 | `GET` | `/api/receive-channels` | 当前用户可选的已启用渠道 |
-| `GET` | `/api/domains/:id/worker-snippet` | 每域 Worker Name、代码、Secret 与路由教程 |
+| `GET` | `/api/domains/:id/worker-snippet` | 每域 Worker Name、代码与 Secret（兼容接口） |
+| `GET` | `/api/domains/:id/setup-guide?scope=all\|specific&address=` | 按渠道与收件范围生成结构化分步接入向导 |
 | `POST` | `/api/domains/:id/test` | SMTP 发送域名接入测试邮件 |
 | `GET` | `/api/domains/:id/test/:token` | 查询测试邮件是否入站 |
 | `GET` | `/api/mails` | 当前租户邮件列表 |
@@ -188,7 +189,10 @@ curl "$PUBLIC_URL/messages" -H "Authorization: Bearer <token>"
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `GET/POST` | `/api/admin/receive-channels` | 收件渠道列表 / 创建 |
-| `PATCH/DELETE` | `/api/admin/receive-channels/:id` | 收件渠道修改 / 删除 |
+| `GET` | `/api/admin/receive-channels/:id/impact` | 修改前查询受影响用户和域名 |
+| `GET` | `/api/admin/receive-channels/:id/setup-guide` | 管理员部署与收集方式配置文档 |
+| `PATCH/DELETE` | `/api/admin/receive-channels/:id` | 修改需 `confirmImpact: true` 二次确认；已绑定渠道禁止删除 |
+| `POST` | `/api/admin/receive-channels/:id/token/rotate` | 二次确认后轮换 Webhook / API Token，仅返回一次 |
 | `POST` | `/api/admin/receive-channels/:id/test` | 渠道连接测试 |
 | `POST` | `/api/admin/receive-channels/:id/sync` | 立即同步 DoneMail |
 | `GET/PUT` | `/api/admin/settings/smtp` | SMTP 配置 |
@@ -218,6 +222,16 @@ Headers:
 ## 4. Cloudflare Worker
 
 仓库 `worker/` 提供管理员自建 Worker；域名向导还会为用户绑定的单个域名生成可复制代码与 `wrangler.toml`。
+
+邮箱转发是组合渠道：
+
+```text
+业务邮箱 → 转发目标地址 → DoneMail API 定时拉取 / 接收 Worker Webhook 推送 → Touch Mail
+```
+
+- `DoneMail API` 收集：配置 Base URL、`X-Admin-Key` 和同步间隔，不生成 Webhook Token。
+- `Webhook` 收集：管理员部署共享接收 Worker，并配置 `RECEIVE_CHANNEL_ID`、`WEBHOOK_SECRET`；域名用户和邮箱服务商只使用转发目标地址，不接触这两个凭据。
+- 匹配整个域名时，Cloudflare 的 `Custom address` 不填 `*` 或 `*@domain`，而是在 Routing rules 中编辑 `Catch-all address`。
 
 ```bash
 cd worker

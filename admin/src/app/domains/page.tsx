@@ -30,22 +30,17 @@ import {
   formatDate,
   qs,
   type Domain,
+  type DomainSetupGuide,
   type DomainVisibility,
   type ReceiveChannel,
   type SmtpStatus,
-  type WorkerSnippet,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { useStableToast } from "@/lib/toast";
 
-type WizardStep = "configure" | "guide" | "test";
+type WizardStep = "configure" | "scope" | "guide" | "test";
+type RoutingScope = "specific" | "all";
 type TestState = "idle" | "sending" | "waiting" | "success" | "timeout";
-
-const STEP_META: { id: WizardStep; label: string; n: number }[] = [
-  { id: "configure", label: "域名与渠道", n: 1 },
-  { id: "guide", label: "接入配置", n: 2 },
-  { id: "test", label: "自动测试", n: 3 },
-];
 
 const CHANNEL_LABEL: Record<ReceiveChannel["type"], string> = {
   worker: "Cloudflare Worker",
@@ -72,7 +67,6 @@ export default function DomainsPage() {
   const [rows, setRows] = useState<Domain[]>([]);
   const [channels, setChannels] = useState<ReceiveChannel[]>([]);
   const [smtp, setSmtp] = useState<SmtpStatus | null>(null);
-  const [publicUrl, setPublicUrl] = useState("");
   const [loading, setLoading] = useState(true);
   const [open, setOpen] = useState(false);
   const [step, setStep] = useState<WizardStep>("configure");
@@ -84,8 +78,11 @@ export default function DomainsPage() {
   const [workerNameTouched, setWorkerNameTouched] = useState(false);
   const [savedDomain, setSavedDomain] = useState<Domain | null>(null);
   const [saving, setSaving] = useState(false);
-  const [snippet, setSnippet] = useState<WorkerSnippet | null>(null);
-  const [codeTab, setCodeTab] = useState("js");
+  const [guide, setGuide] = useState<DomainSetupGuide | null>(null);
+  const [guideStepIndex, setGuideStepIndex] = useState(0);
+  const [codeTab, setCodeTab] = useState("javascript");
+  const [routingScope, setRoutingScope] = useState<RoutingScope>("all");
+  const [specificRecipient, setSpecificRecipient] = useState("");
   const [testRecipient, setTestRecipient] = useState("");
   const [testState, setTestState] = useState<TestState>("idle");
   const isAdmin = user?.role === "admin";
@@ -117,28 +114,24 @@ export default function DomainsPage() {
         toast.error("无法加载收件渠道", error instanceof Error ? error.message : ""),
       );
     api.smtpStatus().then(setSmtp).catch(() => setSmtp(null));
-    api.config().then((config) => setPublicUrl(config.publicUrl)).catch(() => setPublicUrl(""));
   }, [user, load, toast]);
 
   const selectedChannel = channels.find((channel) => channel.id === receiveChannelId) || null;
-  const forwardingAddress =
-    selectedChannel?.type === "email_forward" && user
-      ? selectedChannel.forwardingAddressTemplate
-          .replaceAll("{tenant}", user.tenant)
-          .replaceAll("{domain}", savedDomain?.domain || domain.trim().toLowerCase())
-      : "";
-  const apiPushEndpoint =
-    selectedChannel?.type === "api_push" && publicUrl
-      ? `${publicUrl.replace(/\/$/, "")}/v1/inbound/json/${selectedChannel.id}`
-      : "";
   const canManageSavedDomain = !savedDomain || !isAdmin || savedDomain.userId === user?.id;
 
-  async function loadSnippet(domainId: string) {
-    setSnippet(null);
+  async function loadGuide(
+    domainId: string,
+    scope: RoutingScope = routingScope,
+    address: string = specificRecipient,
+  ) {
     try {
-      setSnippet(await api.workerSnippet(domainId));
+      const result = await api.domainSetupGuide(domainId, scope, address.trim().toLowerCase());
+      setGuide(result);
+      setGuideStepIndex(0);
+      setTestRecipient(result.testRecipient);
+      setStep("guide");
     } catch (error) {
-      toast.error("Worker 配置加载失败", error instanceof Error ? error.message : "");
+      toast.error("接入向导加载失败", error instanceof Error ? error.message : "");
     }
   }
 
@@ -151,8 +144,11 @@ export default function DomainsPage() {
     setWorkerName("");
     setWorkerNameTouched(false);
     setSavedDomain(null);
-    setSnippet(null);
-    setCodeTab("js");
+    setGuide(null);
+    setGuideStepIndex(0);
+    setCodeTab("javascript");
+    setRoutingScope("all");
+    setSpecificRecipient("");
     setTestRecipient("");
     setTestState("idle");
   }
@@ -170,16 +166,19 @@ export default function DomainsPage() {
     setWorkerName(item.workerName || "");
     setWorkerNameTouched(Boolean(item.workerName));
     setSavedDomain(item);
+    setGuide(null);
+    setGuideStepIndex(0);
+    setRoutingScope("all");
+    setSpecificRecipient("");
     setTestRecipient(`test@${item.domain}`);
     setTestState("idle");
-    setCodeTab("js");
-    setStep("guide");
-    setOpen(true);
+    setCodeTab("javascript");
     const channel = channels.find((candidate) => candidate.id === item.receiveChannelId);
-    if (channel?.type === "worker" && (!isAdmin || item.userId === user?.id)) {
-      void loadSnippet(item.id);
-    } else {
-      setSnippet(null);
+    const needsScope = channel?.type === "worker" || channel?.type === "email_forward";
+    setStep(needsScope ? "scope" : "guide");
+    setOpen(true);
+    if (channel && !needsScope && (!isAdmin || item.userId === user?.id)) {
+      void loadGuide(item.id, "all", "");
     }
   }
 
@@ -217,12 +216,16 @@ export default function DomainsPage() {
       setDomain(result.domain.domain);
       setWorkerName(result.domain.workerName || workerName);
       setTestRecipient(`test@${result.domain.domain}`);
-      setStep("guide");
+      setGuide(null);
+      setGuideStepIndex(0);
       setTestState("idle");
       toast.success(savedDomain ? "域名接入配置已更新" : "域名已登记");
       await load();
-      if (selectedChannel.type === "worker") await loadSnippet(result.domain.id);
-      else setSnippet(null);
+      if (selectedChannel.type === "worker" || selectedChannel.type === "email_forward") {
+        setStep("scope");
+      } else {
+        await loadGuide(result.domain.id, "all", "");
+      }
     } catch (error) {
       toast.error("保存失败", error instanceof Error ? error.message : "");
     } finally {
@@ -374,7 +377,38 @@ export default function DomainsPage() {
     },
   ];
 
-  const stepIndex = STEP_META.findIndex((item) => item.id === step);
+  const needsScope = selectedChannel?.type === "worker" || selectedChannel?.type === "email_forward";
+  const guideProgressSteps = guide?.steps.length
+    ? guide.steps.map((item, index) => ({
+        key: `guide-${item.id}`,
+        kind: "guide" as const,
+        label: item.title,
+        guideIndex: index,
+      }))
+    : [{ key: "guide", kind: "guide" as const, label: "接入配置", guideIndex: 0 }];
+  const progressSteps = [
+    { key: "configure", kind: "configure" as const, label: "域名与渠道" },
+    ...(needsScope
+      ? [{ key: "scope", kind: "scope" as const, label: "收件范围" }]
+      : []),
+    ...guideProgressSteps,
+    { key: "test", kind: "test" as const, label: "自动测试" },
+  ];
+  const currentProgressIndex =
+    step === "configure"
+      ? 0
+      : step === "scope"
+        ? 1
+        : step === "guide"
+          ? (needsScope ? 2 : 1) + guideStepIndex
+          : progressSteps.length - 1;
+  const normalizedSpecificRecipient = specificRecipient.trim().toLowerCase();
+  const specificRecipientValid = Boolean(
+    savedDomain &&
+      normalizedSpecificRecipient.split("@").length === 2 &&
+      normalizedSpecificRecipient.endsWith(`@${savedDomain.domain}`),
+  );
+  const currentGuideStep = guide?.steps[guideStepIndex] || null;
   const busyTesting = testState === "sending" || testState === "waiting";
 
   return (
@@ -439,16 +473,23 @@ export default function DomainsPage() {
             </Text>
           </div>
           <div className="mt-4 flex flex-wrap gap-2">
-            {STEP_META.map((item, index) => (
+            {progressSteps.map((item, index) => (
               <Button
-                key={item.id}
+                key={item.key}
                 size="sm"
-                variant={item.id === step ? "primary" : index < stepIndex ? "secondary" : "ghost"}
-                icon={index < stepIndex ? CheckCircleIcon : undefined}
-                disabled={item.id !== "configure" && !savedDomain}
-                onClick={() => setStep(item.id)}
+                variant={index === currentProgressIndex ? "primary" : index < currentProgressIndex ? "secondary" : "ghost"}
+                icon={index < currentProgressIndex ? CheckCircleIcon : undefined}
+                disabled={!savedDomain && item.kind !== "configure"}
+                onClick={() => {
+                  if (item.kind === "guide") {
+                    setGuideStepIndex(item.guideIndex);
+                    setStep("guide");
+                  } else {
+                    setStep(item.kind);
+                  }
+                }}
               >
-                {item.n}. {item.label}
+                {index + 1}. {item.label}
               </Button>
             ))}
           </div>
@@ -562,182 +603,194 @@ export default function DomainsPage() {
               </>
             ) : null}
 
+            {step === "scope" && savedDomain ? (
+              <>
+                <Banner
+                  title="选择要接收的邮箱范围"
+                  description="向导会根据选择生成 Cloudflare 或邮箱服务商中需要填写的精确值。"
+                />
+                <Select
+                  label="收件范围"
+                  hideLabel={false}
+                  value={routingScope}
+                  onValueChange={(value) => {
+                    const scope = value === "specific" ? "specific" : "all";
+                    setRoutingScope(scope);
+                    setGuide(null);
+                    setTestState("idle");
+                    setTestRecipient(scope === "all" ? `test@${savedDomain.domain}` : specificRecipient);
+                  }}
+                >
+                  <Select.Option value="all">整个域名的所有邮箱（Catch-all）</Select.Option>
+                  <Select.Option value="specific">仅一个特定邮箱地址</Select.Option>
+                </Select>
+                {routingScope === "specific" ? (
+                  <Input
+                    label="要接收的完整邮箱地址"
+                    description={`必须属于 ${savedDomain.domain}，例如 support@${savedDomain.domain}`}
+                    type="email"
+                    value={specificRecipient}
+                    onChange={(event) => {
+                      const value = event.target.value.toLowerCase();
+                      setSpecificRecipient(value);
+                      setTestRecipient(value);
+                      setGuide(null);
+                      setTestState("idle");
+                    }}
+                    placeholder={`support@${savedDomain.domain}`}
+                    required
+                  />
+                ) : (
+                  <Banner
+                    variant="alert"
+                    title="匹配全部邮箱不等于填写星号"
+                    description="Cloudflare 中不要在 Custom address 填 * 或 *@域名；后续步骤会引导你编辑 Catch-all address。"
+                  />
+                )}
+                <div className="flex justify-between gap-2">
+                  <Button variant="ghost" onClick={() => setStep("configure")}>上一步</Button>
+                  <Button
+                    icon={ArrowRightIcon}
+                    disabled={routingScope === "specific" && !specificRecipientValid}
+                    onClick={() => void loadGuide(savedDomain.id)}
+                  >
+                    生成分步配置
+                  </Button>
+                </div>
+              </>
+            ) : null}
+
             {step === "guide" && savedDomain ? (
               <>
-                {selectedChannel?.type === "worker" ? (
+                {currentGuideStep ? (
+                  <>
+                    <Banner
+                      title={currentGuideStep.title}
+                      description={`步骤 ${guideStepIndex + 1} / ${guide?.steps.length || 1}，完成本页操作后再继续。`}
+                    />
+                    {currentGuideStep.warning ? (
+                      <Banner
+                        variant="alert"
+                        title="请注意"
+                        description={currentGuideStep.warning}
+                      />
+                    ) : null}
+                    {currentGuideStep.instructions?.length ? (
+                      <LayerCard>
+                        <LayerCard.Secondary>操作路径</LayerCard.Secondary>
+                        <LayerCard.Primary>
+                          <div className="flex flex-col gap-2">
+                            {currentGuideStep.instructions.map((line, index) => (
+                              <Text key={`${index}-${line}`} size="sm">
+                                {index + 1}. {line}
+                              </Text>
+                            ))}
+                          </div>
+                        </LayerCard.Primary>
+                      </LayerCard>
+                    ) : null}
+                    {currentGuideStep.fields?.length ? (
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {currentGuideStep.fields.map((field) => (
+                          <LayerCard key={field.name}>
+                            <LayerCard.Secondary>
+                              <div className="flex items-center justify-between gap-2">
+                                <span>{field.name}</span>
+                                {field.kind === "secret" ? <Badge variant="primary">Secret</Badge> : null}
+                              </div>
+                            </LayerCard.Secondary>
+                            <LayerCard.Primary>
+                              {field.copyable ? (
+                                <ClipboardText
+                                  text={String(field.value)}
+                                  size="sm"
+                                  tooltip={{ text: "复制", copiedText: "已复制" }}
+                                  labels={{ copyAction: `复制 ${field.name}` }}
+                                />
+                              ) : (
+                                <Text size="sm">{String(field.value)}</Text>
+                              )}
+                            </LayerCard.Primary>
+                          </LayerCard>
+                        ))}
+                      </div>
+                    ) : null}
+                    {currentGuideStep.code ? (
+                      <>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <Tabs
+                            tabs={[
+                              { value: "javascript", label: "Worker 代码" },
+                              { value: "wranglerToml", label: "wrangler.toml" },
+                            ]}
+                            value={codeTab}
+                            onValueChange={setCodeTab}
+                          />
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() =>
+                              void copyCode(
+                                codeTab === "javascript"
+                                  ? currentGuideStep.code?.javascript || ""
+                                  : currentGuideStep.code?.wranglerToml || "",
+                                codeTab === "javascript" ? "Worker 代码" : "wrangler.toml",
+                              )
+                            }
+                          >
+                            复制当前代码
+                          </Button>
+                        </div>
+                        <div className="max-h-80 overflow-auto">
+                          <CodeBlock
+                            code={
+                              codeTab === "javascript"
+                                ? currentGuideStep.code.javascript
+                                : currentGuideStep.code.wranglerToml
+                            }
+                            lang={codeTab === "javascript" ? "ts" : "bash"}
+                          />
+                        </div>
+                      </>
+                    ) : null}
+                    <div className="flex justify-between gap-2">
+                      <Button
+                        variant="ghost"
+                        onClick={() => {
+                          if (guideStepIndex > 0) setGuideStepIndex(guideStepIndex - 1);
+                          else setStep(needsScope ? "scope" : "configure");
+                        }}
+                      >
+                        上一步
+                      </Button>
+                      <Button
+                        icon={ArrowRightIcon}
+                        onClick={() => {
+                          if (guide && guideStepIndex < guide.steps.length - 1) {
+                            setGuideStepIndex(guideStepIndex + 1);
+                          } else {
+                            setStep("test");
+                          }
+                        }}
+                      >
+                        {guide && guideStepIndex < guide.steps.length - 1
+                          ? "已完成，下一步"
+                          : "配置已完成，去测试"}
+                      </Button>
+                    </div>
+                  </>
+                ) : (
                   <>
                     <Banner
                       variant="alert"
-                      title={`Worker Name 必须保持为 ${savedDomain.workerName}`}
-                      description="创建 Worker、wrangler.toml 的 name，以及 Email Routing 规则中选择的 Worker，三处名称必须完全一致。Worker 直连不需要邮箱转发。"
+                      title="向导尚未加载"
+                      description="请重新加载当前渠道的结构化接入步骤。"
                     />
-                    <LayerCard>
-                      <LayerCard.Secondary>Worker Name</LayerCard.Secondary>
-                      <LayerCard.Primary>
-                        <ClipboardText
-                          text={savedDomain.workerName}
-                          size="lg"
-                          tooltip={{ text: "复制", copiedText: "已复制" }}
-                          labels={{ copyAction: "复制 Worker Name" }}
-                        />
-                      </LayerCard.Primary>
-                    </LayerCard>
-                    <LayerCard>
-                      <LayerCard.Secondary>创建并部署 Worker</LayerCard.Secondary>
-                      <LayerCard.Primary>
-                        <div className="flex flex-col gap-2">
-                          {(snippet?.setupSteps || []).map((line, index) => (
-                            <Text key={line} size="sm">
-                              {index + 1}. {line}
-                            </Text>
-                          ))}
-                        </div>
-                      </LayerCard.Primary>
-                    </LayerCard>
-                    <LayerCard>
-                      <LayerCard.Secondary>创建 Email Routing 规则</LayerCard.Secondary>
-                      <LayerCard.Primary>
-                        <div className="flex flex-col gap-2">
-                          {(snippet?.routeSteps || []).map((line, index) => (
-                            <Text key={line} size="sm">
-                              {index + 1}. {line}
-                            </Text>
-                          ))}
-                        </div>
-                      </LayerCard.Primary>
-                    </LayerCard>
-                    {snippet ? (
-                      <div className="grid gap-4 md:grid-cols-2">
-                        <LayerCard>
-                          <LayerCard.Secondary>Webhook URL</LayerCard.Secondary>
-                          <LayerCard.Primary>
-                            <ClipboardText
-                              text={snippet.webhookUrl}
-                              size="sm"
-                              tooltip={{ text: "复制", copiedText: "已复制" }}
-                              labels={{ copyAction: "复制 Webhook URL" }}
-                            />
-                          </LayerCard.Primary>
-                        </LayerCard>
-                        <LayerCard>
-                          <LayerCard.Secondary>WEBHOOK_SECRET</LayerCard.Secondary>
-                          <LayerCard.Primary>
-                            <ClipboardText
-                              text={snippet.webhookSecret}
-                              size="sm"
-                              tooltip={{ text: "复制", copiedText: "已复制" }}
-                              labels={{ copyAction: "复制 Worker Secret" }}
-                            />
-                          </LayerCard.Primary>
-                        </LayerCard>
-                      </div>
-                    ) : null}
-                    <div className="flex items-center justify-between gap-2">
-                      <Tabs
-                        tabs={[
-                          { value: "js", label: "Worker 代码" },
-                          { value: "toml", label: "wrangler.toml" },
-                        ]}
-                        value={codeTab}
-                        onValueChange={setCodeTab}
-                      />
-                      {snippet ? (
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          onClick={() =>
-                            void copyCode(
-                              codeTab === "js" ? snippet.js : snippet.wranglerToml,
-                              codeTab === "js" ? "Worker 代码" : "wrangler.toml",
-                            )
-                          }
-                        >
-                          复制当前代码
-                        </Button>
-                      ) : null}
-                    </div>
-                    {snippet ? (
-                      <div className="max-h-80 overflow-auto">
-                        <CodeBlock
-                          code={codeTab === "js" ? snippet.js : snippet.wranglerToml}
-                          lang={codeTab === "js" ? "ts" : "bash"}
-                        />
-                      </div>
-                    ) : (
-                      <Button variant="secondary" onClick={() => void loadSnippet(savedDomain.id)}>
-                        重新加载 Worker 配置
-                      </Button>
-                    )}
+                    <Button variant="secondary" onClick={() => void loadGuide(savedDomain.id)}>
+                      重新加载接入向导
+                    </Button>
                   </>
-                ) : null}
-
-                {selectedChannel?.type === "email_forward" ? (
-                  <>
-                    <Banner
-                      title="把业务邮箱转发到管理员配置的收件地址"
-                      description="只有这个渠道需要邮箱转发；无需由用户部署 Worker。"
-                    />
-                    <LayerCard>
-                      <LayerCard.Secondary>转发目标</LayerCard.Secondary>
-                      <LayerCard.Primary>
-                        <ClipboardText
-                          text={forwardingAddress}
-                          size="lg"
-                          tooltip={{ text: "复制", copiedText: "已复制" }}
-                          labels={{ copyAction: "复制转发目标" }}
-                        />
-                      </LayerCard.Primary>
-                    </LayerCard>
-                    <Text size="sm" variant="secondary">
-                      在企业邮箱中，把需要接入的地址完整转发到上面的目标。系统通过目标地址中的租户标识完成归属。
-                    </Text>
-                  </>
-                ) : null}
-
-                {selectedChannel?.type === "donemail" ? (
-                  <>
-                    <Banner
-                      title={`由 ${selectedChannel.name} 同步邮件`}
-                      description="无需转发到 Touch Mail。管理员已经配置 DoneMail API；系统会按收件域名拉取并去重入库。"
-                    />
-                    <Text size="sm">
-                      请确认域名 {savedDomain.domain} 已在对应 DoneMail 实例中完成 MX / Email Routing 接入。
-                    </Text>
-                  </>
-                ) : null}
-
-                {selectedChannel?.type === "api_push" ? (
-                  <>
-                    <Banner
-                      title="由上游系统主动上报邮件"
-                      description="管理员持有该渠道的 Token；上游按约定向下面的接口 POST 邮件 JSON。"
-                    />
-                    {apiPushEndpoint ? (
-                      <ClipboardText
-                        text={apiPushEndpoint}
-                        size="base"
-                        tooltip={{ text: "复制", copiedText: "已复制" }}
-                        labels={{ copyAction: "复制 API 上报地址" }}
-                      />
-                    ) : null}
-                  </>
-                ) : null}
-
-                {!selectedChannel ? (
-                  <Banner
-                    variant="alert"
-                    title="当前渠道已停用或不存在"
-                    description="返回上一步选择新的管理员收件渠道。"
-                  />
-                ) : null}
-                <div className="flex justify-between gap-2">
-                  <Button variant="ghost" onClick={() => setStep("configure")}>
-                    上一步
-                  </Button>
-                  <Button icon={ArrowRightIcon} onClick={() => setStep("test")}>
-                    下一步：自动测试
-                  </Button>
-                </div>
+                )}
               </>
             ) : null}
 
@@ -796,14 +849,30 @@ export default function DomainsPage() {
                   <LayerCard.Primary>
                     <div className="flex flex-col gap-2">
                       <Text size="sm">1. SMTP 已启用并通过连接测试</Text>
-                      <Text size="sm">2. 当前收件渠道已完成上一页配置</Text>
-                      <Text size="sm">3. Worker 渠道的路由动作是 Send to a Worker</Text>
-                      <Text size="sm">4. Cloudflare 规则选择的 Worker Name 与本页完全一致</Text>
+                      <Text size="sm">2. 已逐步完成当前渠道的全部配置</Text>
+                      <Text size="sm">
+                        3. 当前范围：{routingScope === "all" ? "整个域名（Catch-all）" : testRecipient}
+                      </Text>
+                      <Text size="sm">
+                        4. 收集方式：
+                        {selectedChannel?.type === "email_forward"
+                          ? selectedChannel.collectorType === "donemail"
+                            ? "DoneMail API 拉取"
+                            : "接收 Worker Webhook 推送"
+                          : CHANNEL_LABEL[selectedChannel?.type || "worker"]}
+                      </Text>
                     </div>
                   </LayerCard.Primary>
                 </LayerCard>
                 <div className="flex justify-between gap-2">
-                  <Button variant="ghost" disabled={busyTesting} onClick={() => setStep("guide")}>
+                  <Button
+                    variant="ghost"
+                    disabled={busyTesting}
+                    onClick={() => {
+                      setGuideStepIndex(Math.max(0, (guide?.steps.length || 1) - 1));
+                      setStep("guide");
+                    }}
+                  >
                     上一步
                   </Button>
                   <div className="flex gap-2">

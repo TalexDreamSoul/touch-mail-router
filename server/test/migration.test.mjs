@@ -26,6 +26,34 @@ test("email forwarding channels receive an isolated signing token", async () => 
   }
 });
 
+test("legacy email forwarding channels migrate to Webhook collection", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "touch-mail-forward-migration-"));
+  try {
+    const db = new AppDb(dir);
+    await db.init();
+    await db.createReceiveChannel(
+      {
+        name: "Legacy Forward",
+        type: "email_forward",
+        forwardingAddressTemplate: "{tenant}@inbound.example.com",
+      },
+      "admin",
+    );
+    const file = path.join(dir, "app.json");
+    const raw = JSON.parse(await readFile(file, "utf8"));
+    delete raw.receiveChannels[0].collectorType;
+    await writeFile(file, JSON.stringify(raw), "utf8");
+
+    const migrated = new AppDb(dir);
+    await migrated.init();
+    assert.equal(migrated.listReceiveChannels(true)[0].collectorType, "webhook");
+    const persisted = JSON.parse(await readFile(file, "utf8"));
+    assert.equal(persisted.receiveChannels[0].collectorType, "webhook");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("corrupt database refuses to start without overwriting the file", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "touch-mail-db-corrupt-"));
   const file = path.join(dir, "app.json");

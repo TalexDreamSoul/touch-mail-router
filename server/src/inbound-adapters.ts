@@ -47,6 +47,28 @@ export type InboundMailNotifier = (mail: {
 
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+function usesDoneMail(channel: ReceiveChannel): boolean {
+  return channel.type === "donemail" ||
+    (channel.type === "email_forward" && channel.collectorType === "donemail");
+}
+
+function resolveChannelRecipient(
+  db: AppDb,
+  channel: ReceiveChannel,
+  address: string,
+): { tenant: string } | null {
+  const domain = db.findDomainByAddress(address);
+  if (domain?.receiveChannelId === channel.id) {
+    const user = db.findUserById(domain.userId);
+    return user?.status === "active" ? { tenant: user.tenant } : null;
+  }
+  if (channel.type === "email_forward") {
+    const forwarded = db.resolveForwardedRecipient(channel.id, address);
+    return forwarded ? { tenant: forwarded.user.tenant } : null;
+  }
+  return null;
+}
+
 type DoneMailResponse = {
   ok?: boolean;
   data?: Array<ApiInboundMail & { toDomain?: string }>;
@@ -111,12 +133,9 @@ export async function ingestApiMail(
   const from = String(payload.from || "").trim();
   const to = String(payload.to || "").trim().toLowerCase();
   if (!from || !to.includes("@")) throw new Error("邮件 from/to 格式不正确");
-  const domain = db.findDomainByAddress(to);
-  if (!domain || domain.receiveChannelId !== channel.id) {
-    throw new Error("收件域名未绑定到该接收渠道");
-  }
-  const user = db.findUserById(domain.userId);
-  if (!user || user.status !== "active") throw new Error("域名所属用户不可用");
+  const recipient = resolveChannelRecipient(db, channel, to);
+  if (!recipient) throw new Error("收件地址未绑定到该接收渠道");
+  const tenant = recipient.tenant;
 
   const messageId = sourceMessageId(channel, payload);
   const attachments =
@@ -125,7 +144,7 @@ export async function ingestApiMail(
   if (raw.byteLength > maxBodyBytes) throw new Error("邮件大小超过入站限制");
 
   const { meta, duplicate } = await db.saveMail({
-    tenant: user.tenant,
+    tenant,
     channel: channel.name,
     from,
     to,
@@ -150,14 +169,14 @@ export async function ingestApiMail(
   if (!duplicate && notify) {
     void notify({
       id: meta.id,
-      tenant: user.tenant,
+      tenant,
       channel: channel.name,
       from,
       to,
       subject: String(payload.subject || ""),
     }).catch((error) => console.error("inbound notification failed", error));
   }
-  return { id: meta.id, duplicate, tenant: user.tenant };
+  return { id: meta.id, duplicate, tenant };
 }
 
 function doneMailListUrl(channel: ReceiveChannel, cursor = ""): URL {
@@ -188,7 +207,7 @@ export async function testDoneMailConnection(
   channel: ReceiveChannel,
   fetchImpl: FetchLike = fetch,
 ): Promise<{ mailCount: number }> {
-  if (channel.type !== "donemail") throw new Error("该渠道不是 DoneMail");
+  if (!usesDoneMail(channel)) throw new Error("该渠道未使用 DoneMail API");
   const page = await fetchDoneMailPage(channel, "", fetchImpl);
   return { mailCount: page.data?.length || 0 };
 }
@@ -229,8 +248,8 @@ export async function syncDoneMailChannel(
   fetchImpl: FetchLike = fetch,
   notify?: InboundMailNotifier,
 ): Promise<{ imported: number; duplicates: number; skipped: number }> {
-  if (channel.type !== "donemail" || !channel.enabled) {
-    throw new Error("DoneMail 渠道未启用");
+  if (!usesDoneMail(channel) || !channel.enabled) {
+    throw new Error("DoneMail 收集方式未启用");
   }
   let cursor = "";
   let imported = 0;
@@ -246,18 +265,13 @@ export async function syncDoneMailChannel(
           reachedExisting = true;
           continue;
         }
-        const domain = db.findDomainByAddress(mail.to || "");
-        if (!domain || domain.receiveChannelId !== channel.id) {
-          skipped += 1;
-          continue;
-        }
-        const user = db.findUserById(domain.userId);
-        if (!user) {
+        const recipient = resolveChannelRecipient(db, channel, mail.to || "");
+        if (!recipient) {
           skipped += 1;
           continue;
         }
         const messageId = sourceMessageId(channel, mail);
-        if (await db.existsByMessageId(user.tenant, messageId)) {
+        if (await db.existsByMessageId(recipient.tenant, messageId)) {
           duplicates += 1;
           reachedExisting = true;
           continue;
@@ -305,7 +319,7 @@ export function startDoneMailScheduler(
     running = true;
     try {
       const now = Date.now();
-      for (const channel of db.listReceiveChannels().filter((item) => item.type === "donemail")) {
+      for (const channel of db.listReceiveChannels().filter(usesDoneMail)) {
         const lastSync = channel.lastSyncAt ? Date.parse(channel.lastSyncAt) : 0;
         if (now - lastSync < channel.pollIntervalSeconds * 1000) continue;
         await syncDoneMailChannel(db, channel, maxBodyBytes, fetch, notify).catch((error) => {

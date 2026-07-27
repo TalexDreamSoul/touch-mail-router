@@ -19,12 +19,15 @@ export interface User {
 export type DomainVisibility = "public" | "private";
 
 export type ReceiveChannelType = "worker" | "email_forward" | "donemail" | "api_push";
+export type EmailForwardCollectorType = "webhook" | "donemail";
 
 export interface ReceiveChannel {
   id: string;
   name: string;
   description: string;
   type: ReceiveChannelType;
+  /** Collection backend used after an email has been forwarded. Empty for non-forward channels. */
+  collectorType: EmailForwardCollectorType | "";
   enabled: boolean;
   forwardingAddressTemplate: string;
   baseUrl: string;
@@ -301,21 +304,41 @@ function normalizeReceiveChannel(channel: ReceiveChannel): ReceiveChannel {
   channel.pollIntervalSeconds = Math.min(3600, Math.max(30, channel.pollIntervalSeconds || 60));
   if (!channel.name) throw new Error("请填写收件渠道名称");
   if (channel.type === "worker") {
+    channel.collectorType = "";
     channel.forwardingAddressTemplate = "";
     channel.baseUrl = "";
     channel.adminKey = "";
     channel.pushToken = "";
   } else if (channel.type === "email_forward") {
+    if (channel.collectorType !== "webhook" && channel.collectorType !== "donemail") {
+      throw new Error("请选择邮箱转发后的收集方式");
+    }
     if (!channel.forwardingAddressTemplate.includes("{tenant}")) {
       throw new Error("邮箱转发目标模板必须包含 {tenant}");
     }
     if (!channel.forwardingAddressTemplate.includes("@")) {
       throw new Error("邮箱转发目标模板格式不正确");
     }
-    if (channel.pushToken.length < 16) throw new Error("邮箱转发渠道 Token 至少 16 位");
-    channel.baseUrl = "";
-    channel.adminKey = "";
+    if (channel.collectorType === "webhook") {
+      if (channel.pushToken.length < 16) throw new Error("Webhook 签名 Token 至少 16 位");
+      channel.baseUrl = "";
+      channel.adminKey = "";
+    } else {
+      let url: URL;
+      try {
+        url = new URL(channel.baseUrl);
+      } catch {
+        throw new Error("DoneMail API 地址格式不正确");
+      }
+      if (url.protocol !== "https:" && url.protocol !== "http:") {
+        throw new Error("DoneMail API 地址必须使用 HTTP 或 HTTPS");
+      }
+      if (!channel.adminKey) throw new Error("请填写 DoneMail X-Admin-Key");
+      channel.pushToken = "";
+    }
   } else if (channel.type === "donemail") {
+    // Legacy direct DoneMail channels remain readable and operable.
+    channel.collectorType = "donemail";
     let url: URL;
     try {
       url = new URL(channel.baseUrl);
@@ -329,6 +352,7 @@ function normalizeReceiveChannel(channel: ReceiveChannel): ReceiveChannel {
     channel.forwardingAddressTemplate = "";
     channel.pushToken = "";
   } else if (channel.type === "api_push") {
+    channel.collectorType = "";
     if (channel.pushToken.length < 16) throw new Error("API 上报 Token 至少 16 位");
     channel.forwardingAddressTemplate = "";
     channel.baseUrl = "";
@@ -408,6 +432,11 @@ export class AppDb {
         }
       }
       for (const channel of this.data.receiveChannels) {
+        if (!(channel as Partial<ReceiveChannel>).collectorType) {
+          channel.collectorType =
+            channel.type === "email_forward" ? "webhook" : channel.type === "donemail" ? "donemail" : "";
+          migrated = true;
+        }
         channel.description ||= "";
         channel.forwardingAddressTemplate ||= "";
         channel.baseUrl ||= "";
@@ -843,6 +872,7 @@ export class AppDb {
       name: string;
       description?: string;
       type: ReceiveChannelType;
+      collectorType?: EmailForwardCollectorType;
       enabled?: boolean;
       forwardingAddressTemplate?: string;
       baseUrl?: string;
@@ -858,12 +888,19 @@ export class AppDb {
       name: String(input.name || ""),
       description: String(input.description || ""),
       type: input.type,
+      collectorType:
+        input.type === "email_forward"
+          ? input.collectorType || "webhook"
+          : input.type === "donemail"
+            ? "donemail"
+            : "",
       enabled: input.enabled ?? true,
       forwardingAddressTemplate: String(input.forwardingAddressTemplate || ""),
       baseUrl: String(input.baseUrl || ""),
       adminKey: String(input.adminKey || ""),
       pushToken:
-        input.type === "api_push" || input.type === "email_forward"
+        input.type === "api_push" ||
+        (input.type === "email_forward" && (input.collectorType || "webhook") === "webhook")
           ? String(input.pushToken || `tm_in_${randomBytes(24).toString("base64url")}`)
           : "",
       pollIntervalSeconds: Number(input.pollIntervalSeconds || 60),
@@ -887,6 +924,7 @@ export class AppDb {
       name: string;
       description: string;
       type: ReceiveChannelType;
+      collectorType: EmailForwardCollectorType;
       enabled: boolean;
       forwardingAddressTemplate: string;
       baseUrl: string;
@@ -904,6 +942,8 @@ export class AppDb {
       description:
         patch.description !== undefined ? String(patch.description) : current.description,
       type: patch.type || current.type,
+      collectorType:
+        patch.collectorType !== undefined ? patch.collectorType : current.collectorType,
       enabled: patch.enabled ?? current.enabled,
       forwardingAddressTemplate:
         patch.forwardingAddressTemplate !== undefined
@@ -917,7 +957,12 @@ export class AppDb {
       pushToken:
         patch.pushToken !== undefined && patch.pushToken && !String(patch.pushToken).includes("…")
           ? String(patch.pushToken)
-          : current.pushToken,
+          : current.pushToken ||
+            ((patch.type || current.type) === "api_push" ||
+            ((patch.type || current.type) === "email_forward" &&
+              (patch.collectorType || current.collectorType) === "webhook")
+              ? `tm_in_${randomBytes(24).toString("base64url")}`
+              : ""),
       pollIntervalSeconds:
         patch.pollIntervalSeconds !== undefined
           ? Number(patch.pollIntervalSeconds)
@@ -968,6 +1013,46 @@ export class AppDb {
     return channel.forwardingAddressTemplate
       .replaceAll("{tenant}", tenant.toLowerCase())
       .replaceAll("{domain}", domain.domain);
+  }
+
+  resolveForwardedRecipient(
+    channelId: string,
+    address: string,
+  ): { user: User; domain: Domain } | null {
+    const normalized = address.trim().toLowerCase();
+    for (const domain of this.data.domains) {
+      if (domain.receiveChannelId !== channelId) continue;
+      const user = this.data.users.find((candidate) => candidate.id === domain.userId);
+      if (!user || user.status !== "active") continue;
+      if (this.renderForwardingAddress(domain, user.tenant) === normalized) {
+        return { user, domain };
+      }
+    }
+    return null;
+  }
+
+  getReceiveChannelImpact(channelId: string): {
+    userCount: number;
+    domainCount: number;
+    users: Array<{ id: string; username: string; tenant: string }>;
+    domains: Array<{ id: string; domain: string; userId: string; username: string }>;
+  } {
+    const domains = this.data.domains.filter((domain) => domain.receiveChannelId === channelId);
+    const userIds = new Set(domains.map((domain) => domain.userId));
+    const users = this.data.users
+      .filter((user) => userIds.has(user.id))
+      .map((user) => ({ id: user.id, username: user.username, tenant: user.tenant }));
+    return {
+      userCount: users.length,
+      domainCount: domains.length,
+      users,
+      domains: domains.map((domain) => ({
+        id: domain.id,
+        domain: domain.domain,
+        userId: domain.userId,
+        username: users.find((user) => user.id === domain.userId)?.username || domain.userId,
+      })),
+    };
   }
 
   getSmtpSettings(): SmtpSettings {

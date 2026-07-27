@@ -23,7 +23,6 @@ import { parseRawEmail } from "./parse.js";
 import { buildWorkerSnippet } from "./worker-snippet.js";
 import {
   ingestApiMail,
-  resolveLegacyInboundRecipient,
   startDoneMailScheduler,
   syncDoneMailChannel,
   testDoneMailConnection,
@@ -150,7 +149,6 @@ app.use("*", async (c, next) => {
 });
 
 const SESSION_COOKIE = "tm_session";
-
 function publicUser(u: User) {
   return {
     id: u.id,
@@ -649,6 +647,7 @@ app.get("/api/me/api-docs", requireUser, (c) => {
     endpoints: {
       me: `${base}/ai/v1/me`,
       domains: `${base}/ai/v1/domains`,
+      domainSetupGuide: `${base}/ai/v1/domains/{id}/setup-guide`,
       mails: `${base}/ai/v1/mails`,
       inbound: `${base}/ai/v1/inbound`,
       history: `${base}/ai/v1/history`,
@@ -708,6 +707,147 @@ app.get("/api/domains/:id/worker-snippet", requireUser, (c) => {
   });
 });
 
+app.get("/api/domains/:id/setup-guide", requireUser, (c) => {
+  const user = c.get("user");
+  const domain = db.listDomains(user.id).find((item) => item.id === c.req.param("id"));
+  if (!domain) return c.json({ error: "未找到域名" }, 404);
+  const channel = db.getReceiveChannel(domain.receiveChannelId);
+  if (!channel || !channel.enabled) return c.json({ error: "该域名未绑定可用收件渠道" }, 400);
+
+  const scope = c.req.query("scope") === "specific" ? "specific" : "all";
+  const address = (c.req.query("address") || "").trim().toLowerCase();
+  const addressParts = address.split("@");
+  const validSpecific =
+    scope === "specific" &&
+    addressParts.length === 2 &&
+    Boolean(addressParts[0]) &&
+    addressParts[1] === domain.domain;
+  if (scope === "specific" && !validSpecific) {
+    return c.json({ error: `特定邮箱必须是 ${domain.domain} 下的完整地址` }, 400);
+  }
+  const testRecipient = scope === "specific" ? address : `test@${domain.domain}`;
+
+  if (channel.type === "worker") {
+    if (!domain.workerName) return c.json({ error: "请先配置 Worker Name" }, 400);
+    const webhookUrl = `${config.PUBLIC_URL.replace(/\/$/, "")}/v1/inbound`;
+    const webhookSecret = deriveDomainWebhookSecret(config.WEBHOOK_SECRET, domain.id);
+    const snippet = buildWorkerSnippet({
+      webhookUrl,
+      webhookSecret,
+      domain: domain.domain,
+      workerName: domain.workerName,
+    });
+    return c.json({
+      domainId: domain.id,
+      domain: domain.domain,
+      channel: { id: channel.id, name: channel.name, type: channel.type },
+      scope,
+      testRecipient,
+      steps: [
+        {
+          id: "worker-create",
+          title: "创建并部署 Worker",
+          fields: [{ name: "Worker Name", value: domain.workerName, copyable: true }],
+          instructions: [
+            "Cloudflare → Workers & Pages → Create Worker",
+            "Worker Name 使用本步骤给出的精确值",
+            "用生成代码替换默认代码并 Deploy",
+          ],
+          code: { javascript: snippet.js, wranglerToml: snippet.wranglerToml },
+        },
+        {
+          id: "worker-variables",
+          title: "配置 Worker 变量",
+          instructions: ["Worker → Settings → Variables and Secrets", "保存变量后重新部署"],
+          fields: [
+            { name: "WEBHOOK_URL", value: webhookUrl, kind: "text", copyable: true },
+            { name: "WEBHOOK_SECRET", value: webhookSecret, kind: "secret", copyable: true },
+            { name: "EMAIL_DOMAIN", value: domain.domain, kind: "text", copyable: true },
+          ],
+        },
+        {
+          id: "email-routing",
+          title: scope === "all" ? "配置 Catch-all 路由" : "配置特定邮箱路由",
+          warning:
+            scope === "all"
+              ? "不要在 Custom address 中填写 *、*@域名或任何值；请编辑 Catch-all address。"
+              : undefined,
+          fields:
+            scope === "all"
+              ? [
+                  { name: "Rule", value: "Catch-all address" },
+                  { name: "Custom address", value: "不填写" },
+                  { name: "Action", value: "Send to a Worker" },
+                  { name: "Worker", value: domain.workerName, copyable: true },
+                ]
+              : [
+                  { name: "Custom address", value: addressParts[0], copyable: true },
+                  { name: "Action", value: "Send to a Worker" },
+                  { name: "Worker", value: domain.workerName, copyable: true },
+                ],
+          instructions:
+            scope === "all"
+              ? [
+                  "退出 Add custom address",
+                  "在 Routing rules 找到 Catch-all address 并点击 Edit",
+                  "保存并确认规则状态为 Active",
+                ]
+              : ["点击 Add custom address", "Custom address 只填写 @ 前面的部分", "保存并确认规则状态为 Active"],
+        },
+      ],
+    });
+  }
+
+  if (channel.type === "email_forward") {
+    const target = db.renderForwardingAddress(domain, user.tenant) || "";
+    return c.json({
+      domainId: domain.id,
+      domain: domain.domain,
+      channel: {
+        id: channel.id,
+        name: channel.name,
+        type: channel.type,
+        collectorType: channel.collectorType,
+      },
+      scope,
+      testRecipient,
+      steps: [
+        {
+          id: "forward-scope",
+          title: scope === "all" ? "配置整个域名转发" : "配置特定邮箱转发",
+          warning:
+            scope === "all"
+              ? "邮件服务商必须支持 Catch-all、全域转发或邮件流规则；不要把 * 当成普通邮箱地址。"
+              : undefined,
+          fields: [
+            { name: "Source", value: scope === "all" ? `*@${domain.domain} / Catch-all` : address },
+            { name: "Action", value: "Forward / 转发" },
+            { name: "Target", value: target, copyable: true },
+          ],
+        },
+        {
+          id: "collector",
+          title: channel.collectorType === "donemail" ? "由 DoneMail API 收集" : "由 Webhook Worker 推送",
+          fields: [
+            { name: "Collector", value: channel.collectorType },
+            { name: "Configured", value: channel.collectorType === "donemail" ? Boolean(channel.adminKey) : Boolean(channel.pushToken) },
+          ],
+          instructions: ["收集凭据由管理员配置，域名用户无需填写 Token。"],
+        },
+      ],
+    });
+  }
+
+  return c.json({
+    domainId: domain.id,
+    domain: domain.domain,
+    channel: { id: channel.id, name: channel.name, type: channel.type },
+    scope,
+    testRecipient,
+    steps: [{ id: "collector", title: "按管理员配置的收集方式接入" }],
+  });
+});
+
 // ---------- admin: receive channels ----------
 app.get("/api/admin/receive-channels", requireAdmin, (c) => {
   return c.json({ items: db.listReceiveChannelsPublic(true) });
@@ -725,6 +865,10 @@ app.post("/api/admin/receive-channels", requireAdmin, async (c) => {
         name: String(body.name || ""),
         description: String(body.description || ""),
         type,
+        collectorType:
+          body.collectorType === "donemail" || body.collectorType === "webhook"
+            ? body.collectorType
+            : undefined,
         enabled: body.enabled !== false,
         forwardingAddressTemplate: String(body.forwardingAddressTemplate || ""),
         baseUrl: String(body.baseUrl || ""),
@@ -748,7 +892,8 @@ app.post("/api/admin/receive-channels", requireAdmin, async (c) => {
         ok: true,
         channel: db.getReceiveChannelPublic(channel.id),
         pushToken:
-          channel.type === "api_push" || channel.type === "email_forward"
+          channel.type === "api_push" ||
+          (channel.type === "email_forward" && channel.collectorType === "webhook")
             ? channel.pushToken
             : undefined,
       },
@@ -759,18 +904,43 @@ app.post("/api/admin/receive-channels", requireAdmin, async (c) => {
   }
 });
 
+app.get("/api/admin/receive-channels/:id/impact", requireAdmin, (c) => {
+  const channelId = c.req.param("id") || "";
+  if (!db.getReceiveChannel(channelId)) return c.json({ error: "未找到收件渠道" }, 404);
+  return c.json({ impact: db.getReceiveChannelImpact(channelId) });
+});
+
 app.patch("/api/admin/receive-channels/:id", requireAdmin, async (c) => {
   const actor = c.get("user");
+  const channelId = c.req.param("id") || "";
   const body = await c.req.json().catch(() => ({}));
+  const existing = db.getReceiveChannel(channelId);
+  if (!existing) return c.json({ error: "未找到收件渠道" }, 404);
+  const impact = db.getReceiveChannelImpact(channelId);
+  const hadPushToken = Boolean(existing.pushToken);
+  if (impact.domainCount > 0 && body.confirmImpact !== true) {
+    return c.json(
+      {
+        error: `该变更将影响 ${impact.userCount} 个用户、${impact.domainCount} 个域名，需要二次确认`,
+        code: "RECEIVE_CHANNEL_IMPACT_CONFIRMATION_REQUIRED",
+        impact,
+      },
+      409,
+    );
+  }
   try {
     const channel = await db.updateReceiveChannel(
-      c.req.param("id") || "",
+      channelId,
       {
         name: body.name !== undefined ? String(body.name) : undefined,
         description: body.description !== undefined ? String(body.description) : undefined,
         type: ["worker", "email_forward", "donemail", "api_push"].includes(body.type)
           ? body.type
           : undefined,
+        collectorType:
+          body.collectorType === "donemail" || body.collectorType === "webhook"
+            ? body.collectorType
+            : undefined,
         enabled: body.enabled !== undefined ? Boolean(body.enabled) : undefined,
         forwardingAddressTemplate:
           body.forwardingAddressTemplate !== undefined
@@ -794,7 +964,11 @@ app.patch("/api/admin/receive-channels/:id", requireAdmin, async (c) => {
       detail: `${channel.name} enabled=${channel.enabled}`,
       ip: clientIp(c),
     });
-    return c.json({ ok: true, channel: db.getReceiveChannelPublic(channel.id) });
+    return c.json({
+      ok: true,
+      channel: db.getReceiveChannelPublic(channel.id),
+      pushToken: !hadPushToken && channel.pushToken ? channel.pushToken : undefined,
+    });
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : "更新失败" }, 400);
   }
@@ -803,6 +977,17 @@ app.patch("/api/admin/receive-channels/:id", requireAdmin, async (c) => {
 app.delete("/api/admin/receive-channels/:id", requireAdmin, async (c) => {
   const actor = c.get("user");
   const channelId = c.req.param("id") || "";
+  const impact = db.getReceiveChannelImpact(channelId);
+  if (impact.domainCount > 0) {
+    return c.json(
+      {
+        error: "该收件渠道仍被域名使用，不能删除；请先迁移绑定域名",
+        code: "RECEIVE_CHANNEL_IN_USE",
+        impact,
+      },
+      409,
+    );
+  }
   try {
     const deleted = await db.deleteReceiveChannel(channelId);
     if (!deleted) return c.json({ error: "未找到收件渠道" }, 404);
@@ -820,12 +1005,123 @@ app.delete("/api/admin/receive-channels/:id", requireAdmin, async (c) => {
   }
 });
 
+app.get("/api/admin/receive-channels/:id/setup-guide", requireAdmin, (c) => {
+  const channel = db.getReceiveChannel(c.req.param("id"));
+  if (!channel) return c.json({ error: "未找到收件渠道" }, 404);
+  const impact = db.getReceiveChannelImpact(channel.id);
+  const publicUrl = config.PUBLIC_URL.replace(/\/$/, "");
+
+  if (channel.type === "email_forward") {
+    const collector =
+      channel.collectorType === "donemail"
+        ? {
+            type: "donemail",
+            title: "DoneMail API 定时拉取",
+            secretConfigured: Boolean(channel.adminKey),
+            fields: [
+              { name: "Forward target template", value: channel.forwardingAddressTemplate },
+              { name: "DoneMail Base URL", value: channel.baseUrl },
+              { name: "X-Admin-Key", value: channel.adminKey ? "已配置" : "未配置" },
+              { name: "Poll interval seconds", value: channel.pollIntervalSeconds },
+            ],
+            instructions: [
+              "先确保转发目标域名由 DoneMail 接收",
+              "业务邮箱转发到按用户渲染的目标地址",
+              "Touch Mail 使用 X-Admin-Key 定时读取 /api/mails 和附件",
+              "此模式不使用 RECEIVE_CHANNEL_ID 或 WEBHOOK_SECRET",
+            ],
+          }
+        : {
+            type: "webhook",
+            title: "接收 Worker Webhook 推送",
+            secretConfigured: Boolean(channel.pushToken),
+            fields: [
+              { name: "WEBHOOK_URL", value: `${publicUrl}/v1/inbound` },
+              { name: "RECEIVE_CHANNEL_ID", value: channel.id },
+              { name: "WEBHOOK_SECRET", value: channel.pushToken ? "已配置（创建或轮换时仅返回一次）" : "未配置" },
+              { name: "EMAIL_DOMAIN", value: "转发目标模板中的收件域名" },
+            ],
+            instructions: [
+              "在转发目标域名的 Cloudflare Email Routing 中创建共享接收 Worker",
+              "Worker 使用 RECEIVE_CHANNEL_ID 标识渠道，并用 WEBHOOK_SECRET 对原始邮件签名",
+              "用户和邮件服务商只配置转发目标，不接触渠道 ID 或签名 Token",
+            ],
+          };
+    return c.json({
+      channel: db.getReceiveChannelPublic(channel.id),
+      impact,
+      forwarding: {
+        template: channel.forwardingAddressTemplate,
+        requiredVariables: ["tenant"],
+        optionalVariables: ["domain"],
+      },
+      collector,
+    });
+  }
+
+  if (channel.type === "worker") {
+    return c.json({
+      channel: db.getReceiveChannelPublic(channel.id),
+      impact,
+      instructions: [
+        "每个域名使用独立 Worker、Worker Name 和派生 Secret",
+        "域名用户通过 GET /api/domains/:id/setup-guide 获取完整步骤",
+      ],
+    });
+  }
+
+  return c.json({
+    channel: db.getReceiveChannelPublic(channel.id),
+    impact,
+    endpoint:
+      channel.type === "api_push" ? `${publicUrl}/v1/inbound/json/${channel.id}` : undefined,
+  });
+});
+
+app.post("/api/admin/receive-channels/:id/token/rotate", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const channelId = c.req.param("id") || "";
+  const channel = db.getReceiveChannel(channelId);
+  if (!channel) return c.json({ error: "未找到收件渠道" }, 404);
+  if (
+    channel.type !== "api_push" &&
+    !(channel.type === "email_forward" && channel.collectorType === "webhook")
+  ) {
+    return c.json({ error: "该渠道不使用 Webhook/API Token" }, 400);
+  }
+  const body = await c.req.json().catch(() => ({}));
+  const impact = db.getReceiveChannelImpact(channelId);
+  if (impact.domainCount > 0 && body.confirmImpact !== true) {
+    return c.json(
+      {
+        error: `轮换 Token 将影响 ${impact.userCount} 个用户、${impact.domainCount} 个域名，需要二次确认`,
+        code: "RECEIVE_CHANNEL_IMPACT_CONFIRMATION_REQUIRED",
+        impact,
+      },
+      409,
+    );
+  }
+  const pushToken = `tm_in_${randomBytes(24).toString("base64url")}`;
+  await db.updateReceiveChannel(channelId, { pushToken }, actor.username);
+  await db.addAudit({
+    actorId: actor.id,
+    actorUsername: actor.username,
+    action: "rotate_token",
+    resource: "receive_channel",
+    resourceId: channelId,
+    detail: `affectedUsers=${impact.userCount} affectedDomains=${impact.domainCount}`,
+    ip: clientIp(c),
+  });
+  return c.json({ ok: true, channelId, pushToken, impact });
+});
+
 app.post("/api/admin/receive-channels/:id/test", requireAdmin, async (c) => {
   const channel = db.getReceiveChannel(c.req.param("id"));
   if (!channel) return c.json({ error: "未找到收件渠道" }, 404);
   try {
     const result =
-      channel.type === "donemail"
+      channel.type === "donemail" ||
+      (channel.type === "email_forward" && channel.collectorType === "donemail")
         ? await testDoneMailConnection(channel)
         : {
             ready: true,
@@ -1276,18 +1572,22 @@ app.post(
     if (raw.byteLength === 0) return c.json({ error: "empty body" }, 400);
 
     const envelopeTo = (c.req.header("x-email-to") || "").trim().toLowerCase();
-    const legacyRecipient = resolveLegacyInboundRecipient(envelopeTo, config.INBOUND_DOMAIN);
     const boundDomain = db.findDomainByAddress(envelopeTo);
     const boundChannel = db.getReceiveChannel(boundDomain?.receiveChannelId);
     const forwardedChannel = db.getReceiveChannel(c.req.header("x-receive-channel-id") || "");
+    const forwardedRecipient =
+      forwardedChannel?.type === "email_forward" && forwardedChannel.collectorType === "webhook"
+        ? db.resolveForwardedRecipient(forwardedChannel.id, envelopeTo)
+        : null;
     if (boundChannel?.type === "worker" && !boundChannel.enabled) {
       return c.json({ error: "receive channel disabled" }, 403);
     }
     const directWorker = Boolean(boundDomain && boundChannel?.type === "worker");
     const emailForward = Boolean(
       !directWorker &&
-      legacyRecipient &&
+      forwardedRecipient &&
       forwardedChannel?.type === "email_forward" &&
+      forwardedChannel.collectorType === "webhook" &&
       forwardedChannel.enabled,
     );
     if (!directWorker && !emailForward) {
@@ -1317,7 +1617,7 @@ app.post(
       tenant = owner.tenant;
       channel = boundChannel.name;
     } else {
-      tenant = legacyRecipient?.tenant || "";
+      tenant = forwardedRecipient?.user.tenant || "";
       channel = forwardedChannel?.name || "email-forward";
     }
     if (!tenant) return c.json({ error: "missing x-tenant" }, 400);
