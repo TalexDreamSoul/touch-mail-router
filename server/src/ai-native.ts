@@ -70,6 +70,12 @@ export function buildOpenApi(config: AppConfig) {
           bearerFormat: "dk_…",
           description: "Personal API key from admin → API Keys",
         },
+        cookieAuth: {
+          type: "apiKey",
+          in: "cookie",
+          name: "tm_session",
+          description: "Administrator session cookie returned by /api/auth/login",
+        },
       },
     },
     security: [{ bearerAuth: [] }],
@@ -79,6 +85,79 @@ export function buildOpenApi(config: AppConfig) {
           security: [],
           summary: "Health check",
           responses: { "200": { description: "OK" } },
+        },
+      },
+      "/api/auth/channels": {
+        get: {
+          security: [],
+          summary: "List enabled external login channels",
+          tags: ["authentication"],
+          responses: { "200": { description: "Public channel IDs, names, and types" } },
+        },
+      },
+      "/api/auth/oauth/start/{id}": {
+        get: {
+          security: [],
+          summary: "Start Feishu or OIDC authorization with signed state and PKCE",
+          tags: ["authentication"],
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "302": { description: "Redirect to identity provider" } },
+        },
+      },
+      "/api/auth/oauth/callback": {
+        get: {
+          security: [],
+          summary: "OAuth/OIDC callback and Touch Mail session creation",
+          tags: ["authentication"],
+          responses: { "302": { description: "Redirect to dashboard or login error" } },
+        },
+      },
+      "/api/admin/login-channels": {
+        get: {
+          security: [{ cookieAuth: [] }],
+          summary: "List login channels and callback configuration",
+          tags: ["admin-login-channels"],
+          responses: { "200": { description: "Sanitized login channels" } },
+        },
+        post: {
+          security: [{ cookieAuth: [] }],
+          summary: "Create an OIDC login channel",
+          tags: ["admin-login-channels"],
+          responses: { "201": { description: "Created" } },
+        },
+      },
+      "/api/admin/login-channels/feishu": {
+        post: {
+          security: [{ cookieAuth: [] }],
+          summary: "Create a login channel from saved Feishu credentials",
+          tags: ["admin-login-channels"],
+          responses: { "201": { description: "Created" } },
+        },
+      },
+      "/api/admin/login-channels/{id}": {
+        patch: {
+          security: [{ cookieAuth: [] }],
+          summary: "Update a login channel",
+          description: "Issuer, Client ID, and subject claim are locked after identities exist.",
+          tags: ["admin-login-channels"],
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Updated" }, "400": { description: "Locked or invalid" } },
+        },
+        delete: {
+          security: [{ cookieAuth: [] }],
+          summary: "Delete an unused login channel",
+          tags: ["admin-login-channels"],
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Deleted" }, "400": { description: "Channel has identities" } },
+        },
+      },
+      "/api/admin/login-channels/{id}/test": {
+        post: {
+          security: [{ cookieAuth: [] }],
+          summary: "Validate discovery and build an authorization URL",
+          tags: ["admin-login-channels"],
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "Configuration is usable" }, "502": { description: "Provider validation failed" } },
         },
       },
       "/ai/v1/me": {

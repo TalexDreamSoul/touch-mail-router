@@ -11,7 +11,8 @@ import {
   Surface,
   Text,
 } from "@cloudflare/kumo";
-import { api } from "@/lib/api";
+import { SignInIcon } from "@phosphor-icons/react";
+import { api, type LoginChannel } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 
 export default function LoginPage() {
@@ -23,10 +24,28 @@ export default function LoginPage() {
   const [displayName, setDisplayName] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [channels, setChannels] = useState<
+    Array<Pick<LoginChannel, "id" | "name" | "type">>
+  >([]);
+  const [publicUrl, setPublicUrl] = useState("");
 
   useEffect(() => {
     if (!loading && user) router.replace("/dashboard");
   }, [user, loading, router]);
+
+  useEffect(() => {
+    const oauthError = new URLSearchParams(window.location.search).get("oauth_error");
+    if (oauthError) setError(oauthError);
+    void Promise.all([api.loginChannels(), api.config()])
+      .then(([channelResult, config]) => {
+        setChannels(channelResult.items || []);
+        setPublicUrl(config.publicUrl.replace(/\/$/, ""));
+      })
+      .catch(() => {
+        setChannels([]);
+        setPublicUrl("");
+      });
+  }, []);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -91,6 +110,32 @@ export default function LoginPage() {
                 {mode === "login" ? "登录" : "注册"}
               </Button>
             </form>
+
+            {mode === "login" && channels.length > 0 ? (
+              <div className="flex flex-col gap-3">
+                <div className="text-center">
+                  <Text size="sm" variant="secondary">
+                    或使用登录渠道
+                  </Text>
+                </div>
+                {channels.map((channel) => (
+                  <Button
+                    key={channel.id}
+                    type="button"
+                    variant="secondary"
+                    icon={SignInIcon}
+                    disabled={submitting}
+                    onClick={() =>
+                      window.location.assign(
+                        `${publicUrl || window.location.origin}/api/auth/oauth/start/${channel.id}`,
+                      )
+                    }
+                  >
+                    使用{channel.name}登录
+                  </Button>
+                ))}
+              </div>
+            ) : null}
 
             <Button
               variant="ghost"

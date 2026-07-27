@@ -7,6 +7,10 @@ const config = { PUBLIC_URL: "https://mail.example.com/" };
 test("AI-native discovery exposes domain setup guides", () => {
   const openapi = buildOpenApi(config);
   assert.ok(openapi.paths["/ai/v1/domains/{id}/setup-guide"]);
+  assert.ok(openapi.paths["/api/auth/channels"]);
+  assert.ok(openapi.paths["/api/admin/login-channels"]);
+  assert.ok(openapi.paths["/api/admin/login-channels/{id}/test"]);
+  assert.equal(openapi.components.securitySchemes.cookieAuth.name, "tm_session");
 
   const manifest = buildSkillManifest(config);
   assert.equal(

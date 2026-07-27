@@ -29,6 +29,13 @@ import {
   type InboundMailNotifier,
 } from "./inbound-adapters.js";
 import { sendSmtpMail, verifySmtpSettings } from "./smtp.js";
+import {
+  buildOAuthAuthorizationUrl,
+  exchangeOAuthProfile,
+  sealOAuthState,
+  unsealOAuthState,
+  type OAuthCookieState,
+} from "./oauth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "..", "public");
@@ -149,6 +156,9 @@ app.use("*", async (c, next) => {
 });
 
 const SESSION_COOKIE = "tm_session";
+const OAUTH_COOKIE = "tm_oauth";
+const OAUTH_CALLBACK_URL = `${config.PUBLIC_URL.replace(/\/$/, "")}/api/auth/oauth/callback`;
+
 function publicUser(u: User) {
   return {
     id: u.id,
@@ -178,6 +188,33 @@ function setSessionCookie(c: Parameters<typeof setCookie>[0], sessionId: string)
     secure: config.COOKIE_SECURE,
     maxAge: 30 * 24 * 3600,
   });
+}
+
+function setOAuthCookie(c: Parameters<typeof setCookie>[0], value: OAuthCookieState) {
+  setCookie(c, OAUTH_COOKIE, sealOAuthState(value, config.SESSION_SECRET), {
+    httpOnly: true,
+    path: "/",
+    sameSite: "Lax",
+    secure: config.COOKIE_SECURE,
+    maxAge: 10 * 60,
+  });
+}
+
+function readOAuthCookie(c: Context<{ Variables: Vars }>): OAuthCookieState | null {
+  const raw = getCookie(c, OAUTH_COOKIE);
+  return raw ? unsealOAuthState(raw, config.SESSION_SECRET) : null;
+}
+
+function secureTextEqual(left: string, right: string): boolean {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function oauthErrorRedirect(c: Context<{ Variables: Vars }>, message: string) {
+  const url = new URL("/login", config.PUBLIC_URL);
+  url.searchParams.set("oauth_error", message.slice(0, 300));
+  return c.redirect(url.toString());
 }
 
 async function requireUser(c: Context<{ Variables: Vars }>, next: Next) {
@@ -279,6 +316,83 @@ app.post("/api/auth/login", async (c) => {
     ip: clientIp(c),
   });
   return c.json({ ok: true, user: publicUser(user) });
+});
+
+app.get("/api/auth/channels", (c) => {
+  return c.json({
+    items: db.listLoginChannels(false).map((channel) => ({
+      id: channel.id,
+      name: channel.name,
+      type: channel.type,
+    })),
+  });
+});
+
+app.get("/api/auth/oauth/start/:id", async (c) => {
+  const channel = db.getLoginChannel(c.req.param("id"));
+  if (!channel || !channel.enabled) return oauthErrorRedirect(c, "登录渠道不可用");
+  const state = randomBytes(24).toString("base64url");
+  const verifier = randomBytes(32).toString("base64url");
+  try {
+    const authorizationUrl = await buildOAuthAuthorizationUrl(
+      channel,
+      db.getFeishuSettings(),
+      OAUTH_CALLBACK_URL,
+      state,
+      verifier,
+    );
+    setOAuthCookie(c, { channelId: channel.id, state, verifier, createdAt: Date.now() });
+    return c.redirect(authorizationUrl);
+  } catch (error) {
+    return oauthErrorRedirect(c, error instanceof Error ? error.message : "无法发起登录");
+  }
+});
+
+app.get("/api/auth/oauth/callback", async (c) => {
+  const saved = readOAuthCookie(c);
+  const returnedState = c.req.query("state") || "";
+  if (!saved || !secureTextEqual(saved.state, returnedState)) {
+    return oauthErrorRedirect(c, "登录状态已失效，请重新发起登录");
+  }
+  deleteCookie(c, OAUTH_COOKIE, { path: "/" });
+  if (c.req.query("error")) return oauthErrorRedirect(c, "已取消授权");
+  const code = c.req.query("code") || "";
+  if (!code) return oauthErrorRedirect(c, "登录渠道未返回授权码");
+  const channel = db.getLoginChannel(saved.channelId);
+  if (!channel || !channel.enabled) return oauthErrorRedirect(c, "登录渠道已停用");
+
+  try {
+    const profile = await exchangeOAuthProfile(
+      channel,
+      db.getFeishuSettings(),
+      OAUTH_CALLBACK_URL,
+      code,
+      saved.verifier,
+    );
+    const { user, isNew } = await db.resolveAuthIdentity(channel.id, profile);
+    if (user.status === "disabled") return oauthErrorRedirect(c, "账号已禁用");
+    const session = await db.createSession(user.id);
+    setSessionCookie(c, session.id);
+    await db.addAudit({
+      actorId: user.id,
+      actorUsername: user.username,
+      action: isNew ? "oauth_register" : "oauth_login",
+      resource: "auth",
+      resourceId: channel.id,
+      detail: `channel=${channel.name} type=${channel.type}`,
+      ip: clientIp(c),
+    });
+    return c.redirect(new URL("/dashboard", config.PUBLIC_URL).toString());
+  } catch (error) {
+    await db.addAudit({
+      action: "oauth_login_failed",
+      resource: "auth",
+      resourceId: channel.id,
+      detail: error instanceof Error ? error.message : "OAuth 登录失败",
+      ip: clientIp(c),
+    });
+    return oauthErrorRedirect(c, error instanceof Error ? error.message : "OAuth 登录失败");
+  }
 });
 
 app.post("/api/auth/logout", async (c) => {
@@ -848,6 +962,159 @@ app.get("/api/domains/:id/setup-guide", requireUser, (c) => {
   });
 });
 
+// ---------- admin: login channels ----------
+app.get("/api/admin/login-channels", requireAdmin, (c) => {
+  const feishu = db.getFeishuSettings();
+  const items = db.listLoginChannelsPublic(true).map((channel) => ({
+    ...channel,
+    identityCount: db.getLoginChannelIdentityCount(channel.id),
+  }));
+  return c.json({
+    items,
+    callbackUrl: OAUTH_CALLBACK_URL,
+    feishuReady: Boolean(feishu.enabled && feishu.appId && feishu.appSecret),
+    feishuChannelExists: items.some((channel) => channel.type === "feishu"),
+  });
+});
+
+app.post("/api/admin/login-channels/feishu", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const feishu = db.getFeishuSettings();
+  if (!feishu.enabled || !feishu.appId || !feishu.appSecret) {
+    return c.json({ error: "请先启用飞书配置并填写 App ID、App Secret" }, 400);
+  }
+  try {
+    const channel = await db.createLoginChannel(
+      { name: "飞书", type: "feishu", enabled: true },
+      actor.username,
+    );
+    await db.updateFeishuSettings({ oauthRedirectUri: OAUTH_CALLBACK_URL }, actor.username);
+    await db.addAudit({
+      actorId: actor.id,
+      actorUsername: actor.username,
+      action: "create",
+      resource: "login_channel",
+      resourceId: channel.id,
+      detail: "飞书登录",
+      ip: clientIp(c),
+    });
+    const publicChannel = db.listLoginChannelsPublic(true).find((item) => item.id === channel.id);
+    return c.json({ ok: true, channel: publicChannel }, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "创建失败" }, 400);
+  }
+});
+
+app.post("/api/admin/login-channels", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const body = await c.req.json().catch(() => ({}));
+  try {
+    const channel = await db.createLoginChannel(
+      {
+        name: String(body.name || ""),
+        type: "oidc",
+        enabled: body.enabled !== false,
+        issuer: String(body.issuer || ""),
+        clientId: String(body.clientId || ""),
+        clientSecret: String(body.clientSecret || ""),
+        scopes: Array.isArray(body.scopes) ? body.scopes.map(String) : [],
+        subjectClaim: String(body.subjectClaim || "sub"),
+        usernameClaim: String(body.usernameClaim || "preferred_username"),
+        displayNameClaim: String(body.displayNameClaim || "name"),
+      },
+      actor.username,
+    );
+    await db.addAudit({
+      actorId: actor.id,
+      actorUsername: actor.username,
+      action: "create",
+      resource: "login_channel",
+      resourceId: channel.id,
+      detail: `${channel.name} type=oidc`,
+      ip: clientIp(c),
+    });
+    const publicChannel = db.listLoginChannelsPublic(true).find((item) => item.id === channel.id);
+    return c.json({ ok: true, channel: publicChannel }, 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "创建失败" }, 400);
+  }
+});
+
+app.patch("/api/admin/login-channels/:id", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const channelId = c.req.param("id") || "";
+  const body = await c.req.json().catch(() => ({}));
+  try {
+    const channel = await db.updateLoginChannel(
+      channelId,
+      {
+        name: body.name !== undefined ? String(body.name) : undefined,
+        enabled: body.enabled !== undefined ? Boolean(body.enabled) : undefined,
+        issuer: body.issuer !== undefined ? String(body.issuer) : undefined,
+        clientId: body.clientId !== undefined ? String(body.clientId) : undefined,
+        clientSecret: body.clientSecret !== undefined ? String(body.clientSecret) : undefined,
+        scopes: Array.isArray(body.scopes) ? body.scopes.map(String) : undefined,
+        subjectClaim: body.subjectClaim !== undefined ? String(body.subjectClaim) : undefined,
+        usernameClaim: body.usernameClaim !== undefined ? String(body.usernameClaim) : undefined,
+        displayNameClaim:
+          body.displayNameClaim !== undefined ? String(body.displayNameClaim) : undefined,
+      },
+      actor.username,
+    );
+    if (!channel) return c.json({ error: "未找到登录渠道" }, 404);
+    await db.addAudit({
+      actorId: actor.id,
+      actorUsername: actor.username,
+      action: "update",
+      resource: "login_channel",
+      resourceId: channel.id,
+      detail: `${channel.name} enabled=${channel.enabled}`,
+      ip: clientIp(c),
+    });
+    const publicChannel = db.listLoginChannelsPublic(true).find((item) => item.id === channel.id);
+    return c.json({ ok: true, channel: publicChannel });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "更新失败" }, 400);
+  }
+});
+
+app.post("/api/admin/login-channels/:id/test", requireAdmin, async (c) => {
+  const channel = db.getLoginChannel(c.req.param("id"));
+  if (!channel) return c.json({ error: "未找到登录渠道" }, 404);
+  try {
+    const authorizationUrl = await buildOAuthAuthorizationUrl(
+      channel,
+      db.getFeishuSettings(),
+      OAUTH_CALLBACK_URL,
+      randomBytes(24).toString("base64url"),
+      randomBytes(32).toString("base64url"),
+    );
+    return c.json({ ok: true, authorizationUrl, callbackUrl: OAUTH_CALLBACK_URL });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "登录渠道测试失败" }, 502);
+  }
+});
+
+app.delete("/api/admin/login-channels/:id", requireAdmin, async (c) => {
+  const actor = c.get("user");
+  const channelId = c.req.param("id") || "";
+  try {
+    const removed = await db.deleteLoginChannel(channelId);
+    if (!removed) return c.json({ error: "未找到登录渠道" }, 404);
+    await db.addAudit({
+      actorId: actor.id,
+      actorUsername: actor.username,
+      action: "delete",
+      resource: "login_channel",
+      resourceId: channelId,
+      ip: clientIp(c),
+    });
+    return c.json({ ok: true });
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "删除失败" }, 400);
+  }
+});
+
 // ---------- admin: receive channels ----------
 app.get("/api/admin/receive-channels", requireAdmin, (c) => {
   return c.json({ items: db.listReceiveChannelsPublic(true) });
@@ -1295,6 +1562,23 @@ app.get("/api/admin/settings/feishu", requireAdmin, (c) => {
 app.put("/api/admin/settings/feishu", requireAdmin, async (c) => {
   const actor = c.get("user");
   const body = await c.req.json().catch(() => ({}));
+  const current = db.getFeishuSettings();
+  const feishuLoginChannel = db.listLoginChannels(true).find((channel) => channel.type === "feishu");
+  const submittedAppId = body.appId !== undefined ? String(body.appId).trim() : current.appId;
+  if (
+    feishuLoginChannel &&
+    db.getLoginChannelIdentityCount(feishuLoginChannel.id) > 0 &&
+    submittedAppId !== current.appId
+  ) {
+    return c.json(
+      {
+        error: "飞书登录渠道已有用户身份记录，不能更换 App ID；请先迁移登录身份或新建独立渠道",
+        code: "LOGIN_CHANNEL_IDENTITY_PROVIDER_LOCKED",
+        identityCount: db.getLoginChannelIdentityCount(feishuLoginChannel.id),
+      },
+      409,
+    );
+  }
   const settings = await db.updateFeishuSettings(
     {
       enabled: Boolean(body.enabled),
@@ -1305,8 +1589,11 @@ app.put("/api/admin/settings/feishu", requireAdmin, async (c) => {
         body.verificationToken !== undefined ? String(body.verificationToken) : undefined,
       notifyChatId: body.notifyChatId !== undefined ? String(body.notifyChatId) : undefined,
       notifyOnInbound: body.notifyOnInbound !== undefined ? Boolean(body.notifyOnInbound) : undefined,
-      oauthRedirectUri:
-        body.oauthRedirectUri !== undefined ? String(body.oauthRedirectUri) : undefined,
+      oauthRedirectUri: db.listLoginChannels(true).some((channel) => channel.type === "feishu")
+        ? OAUTH_CALLBACK_URL
+        : body.oauthRedirectUri !== undefined
+          ? String(body.oauthRedirectUri)
+          : undefined,
     },
     actor.username,
   );

@@ -3,6 +3,7 @@ const app = document.getElementById("app");
 const state = {
   user: null,
   config: null,
+  loginChannels: [],
   view: "overview",
   loading: true,
   toastTimer: null,
@@ -103,6 +104,7 @@ function render() {
 function renderAuth() {
   const route = routeFromHash();
   const mode = route.mode === "register" ? "register" : "login";
+  const oauthError = new URLSearchParams(location.search).get("oauth_error") || "";
   app.innerHTML = `
     <div class="landing">
       <div class="shell topbar">
@@ -124,7 +126,7 @@ function renderAuth() {
             <button type="button" data-mode="login" class="${mode === "login" ? "active" : ""}">登录</button>
             <button type="button" data-mode="register" class="${mode === "register" ? "active" : ""}">注册</button>
           </div>
-          <div id="auth-alert"></div>
+          <div id="auth-alert">${oauthError ? `<div class="alert alert-error">${esc(oauthError)}</div>` : ""}</div>
           <form id="auth-form">
             ${
               mode === "register"
@@ -141,6 +143,19 @@ function renderAuth() {
             </div>
             <button class="btn btn-primary btn-block" type="submit">${mode === "register" ? "创建账号" : "登录"}</button>
           </form>
+          ${
+            mode === "login" && state.loginChannels.length
+              ? `<div class="muted" style="margin:1rem 0;text-align:center">或使用登录渠道</div>
+                 <div style="display:grid;gap:.65rem">
+                   ${state.loginChannels
+                     .map(
+                       (channel) =>
+                         `<button type="button" class="btn btn-ghost btn-block" data-oauth-channel="${esc(channel.id)}">使用 ${esc(channel.name)} 登录</button>`,
+                     )
+                     .join("")}
+                 </div>`
+              : ""
+          }
         </div>
       </div>
       <div class="shell footer-note">转发接入长期可用 · 重要客户可再升级子域 MX</div>
@@ -151,6 +166,12 @@ function renderAuth() {
     btn.addEventListener("click", () => {
       setHash(btn.dataset.mode);
       renderAuth();
+    });
+  });
+
+  app.querySelectorAll("[data-oauth-channel]").forEach((button) => {
+    button.addEventListener("click", () => {
+      location.assign(`/api/auth/oauth/start/${encodeURIComponent(button.dataset.oauthChannel)}`);
     });
   });
 
@@ -500,9 +521,14 @@ async function loadWorker(main) {
 // ---------- boot ----------
 async function boot() {
   try {
-    const [cfg, me] = await Promise.all([api("/api/config"), api("/api/auth/me")]);
+    const [cfg, me, channels] = await Promise.all([
+      api("/api/config"),
+      api("/api/auth/me"),
+      api("/api/auth/channels").catch(() => ({ items: [] })),
+    ]);
     state.config = cfg;
     state.user = me.user;
+    state.loginChannels = channels.items || [];
     if (state.user) {
       state.user.inboundAddress = `${state.user.tenant}@${cfg.inboundDomain}`;
     }

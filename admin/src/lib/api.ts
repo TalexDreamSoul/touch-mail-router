@@ -9,6 +9,27 @@ export type User = {
   updatedAt?: string;
 };
 
+export type LoginChannelType = "feishu" | "oidc";
+
+export type LoginChannel = {
+  id: string;
+  name: string;
+  type: LoginChannelType;
+  enabled: boolean;
+  issuer: string;
+  clientId: string;
+  clientSecret: string;
+  clientSecretSet: boolean;
+  identityCount?: number;
+  scopes: string[];
+  subjectClaim: string;
+  usernameClaim: string;
+  displayNameClaim: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy: string;
+};
+
 export type DomainVisibility = "public" | "private";
 export type ReceiveChannelType = "worker" | "email_forward" | "donemail" | "api_push";
 export type EmailForwardCollectorType = "webhook" | "donemail";
@@ -291,6 +312,10 @@ export const api = {
       body: JSON.stringify({ username, password, displayName }),
     }),
   logout: () => request<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
+  loginChannels: () =>
+    request<{ items: Array<Pick<LoginChannel, "id" | "name" | "type">> }>(
+      "/api/auth/channels",
+    ),
   config: () =>
     request<{ appName: string; publicUrl: string; inboundDomain: string }>("/api/config"),
   dashboard: () => request<Record<string, unknown>>("/api/dashboard"),
@@ -404,6 +429,44 @@ export const api = {
     request<PageResult<MailMeta>>(`/api/admin/mails?${params}`),
   auditLogs: (params: URLSearchParams) =>
     request<PageResult<AuditLog>>(`/api/admin/audit-logs?${params}`),
+  adminLoginChannels: () =>
+    request<{
+      items: LoginChannel[];
+      callbackUrl: string;
+      feishuReady: boolean;
+      feishuChannelExists: boolean;
+    }>("/api/admin/login-channels"),
+  addFeishuLoginChannel: () =>
+    request<{ ok: boolean; channel: LoginChannel }>("/api/admin/login-channels/feishu", {
+      method: "POST",
+    }),
+  createLoginChannel: (body: {
+    name: string;
+    enabled: boolean;
+    issuer: string;
+    clientId: string;
+    clientSecret: string;
+    scopes: string[];
+    subjectClaim: string;
+    usernameClaim: string;
+    displayNameClaim: string;
+  }) =>
+    request<{ ok: boolean; channel: LoginChannel }>("/api/admin/login-channels", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateLoginChannel: (id: string, body: Partial<LoginChannel>) =>
+    request<{ ok: boolean; channel: LoginChannel }>(`/api/admin/login-channels/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  testLoginChannel: (id: string) =>
+    request<{ ok: boolean; authorizationUrl: string; callbackUrl: string }>(
+      `/api/admin/login-channels/${id}/test`,
+      { method: "POST" },
+    ),
+  deleteLoginChannel: (id: string) =>
+    request<{ ok: boolean }>(`/api/admin/login-channels/${id}`, { method: "DELETE" }),
   adminReceiveChannels: () =>
     request<{ items: ReceiveChannel[] }>("/api/admin/receive-channels"),
   createReceiveChannel: (body: {

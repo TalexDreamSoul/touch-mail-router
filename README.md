@@ -171,7 +171,10 @@ curl "$PUBLIC_URL/messages" -H "Authorization: Bearer <token>"
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/api/config` | 公开配置 |
 | `POST` | `/api/auth/register` | 注册 |
-| `POST` | `/api/auth/login` | 登录 |
+| `POST` | `/api/auth/login` | 密码登录 |
+| `GET` | `/api/auth/channels` | 获取登录页可用的外部登录渠道 |
+| `GET` | `/api/auth/oauth/start/:id` | 发起飞书/OIDC 授权（state + PKCE） |
+| `GET` | `/api/auth/oauth/callback` | OAuth/OIDC 回调，校验签名状态后建立会话 |
 | `GET/POST/PATCH/DELETE` | `/api/domains*` | 域名与收件渠道绑定 |
 | `GET` | `/api/receive-channels` | 当前用户可选的已启用渠道 |
 | `GET` | `/api/domains/:id/worker-snippet` | 每域 Worker Name、代码与 Secret（兼容接口） |
@@ -188,6 +191,10 @@ curl "$PUBLIC_URL/messages" -H "Authorization: Bearer <token>"
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
+| `GET/POST` | `/api/admin/login-channels` | 登录渠道列表 / 创建 OIDC 渠道 |
+| `POST` | `/api/admin/login-channels/feishu` | 复用飞书配置创建飞书登录渠道 |
+| `PATCH/DELETE` | `/api/admin/login-channels/:id` | 更新 / 删除登录渠道；已有身份时 Provider 关键字段锁定 |
+| `POST` | `/api/admin/login-channels/:id/test` | 验证 OIDC Discovery、授权端点和 PKCE URL |
 | `GET/POST` | `/api/admin/receive-channels` | 收件渠道列表 / 创建 |
 | `GET` | `/api/admin/receive-channels/:id/impact` | 修改前查询受影响用户和域名 |
 | `GET` | `/api/admin/receive-channels/:id/setup-guide` | 管理员部署与收集方式配置文档 |

@@ -100,6 +100,39 @@ export interface Session {
   expiresAt: string;
 }
 
+export type LoginChannelType = "feishu" | "oidc";
+
+export interface LoginChannel {
+  id: string;
+  name: string;
+  type: LoginChannelType;
+  enabled: boolean;
+  issuer: string;
+  clientId: string;
+  clientSecret: string;
+  scopes: string[];
+  subjectClaim: string;
+  usernameClaim: string;
+  displayNameClaim: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export type PublicLoginChannel = Omit<LoginChannel, "clientSecret"> & {
+  clientSecret: string;
+  clientSecretSet: boolean;
+};
+
+export interface AuthIdentity {
+  id: string;
+  channelId: string;
+  subject: string;
+  userId: string;
+  createdAt: string;
+  lastLoginAt: string;
+}
+
 export interface MailMeta {
   id: string;
   tenant: string;
@@ -186,6 +219,8 @@ interface DbShape {
   users: User[];
   domains: Domain[];
   receiveChannels: ReceiveChannel[];
+  loginChannels: LoginChannel[];
+  authIdentities: AuthIdentity[];
   sessions: Session[];
   auditLogs: AuditLog[];
   mailAccounts: MailAccount[];
@@ -363,12 +398,66 @@ function normalizeReceiveChannel(channel: ReceiveChannel): ReceiveChannel {
   return channel;
 }
 
+function publicLoginChannel(channel: LoginChannel): PublicLoginChannel {
+  return {
+    ...channel,
+    clientSecret: channel.clientSecret ? "••••••••" : "",
+    clientSecretSet: Boolean(channel.clientSecret),
+  };
+}
+
+function normalizeLoginChannel(channel: LoginChannel): LoginChannel {
+  channel.name = channel.name.trim().slice(0, 80);
+  channel.issuer = channel.issuer.trim().replace(/\/$/, "");
+  channel.clientId = channel.clientId.trim();
+  channel.clientSecret = channel.clientSecret.trim();
+  channel.scopes = [...new Set(channel.scopes.map((scope) => scope.trim()).filter(Boolean))];
+  channel.subjectClaim = channel.subjectClaim.trim() || "sub";
+  channel.usernameClaim = channel.usernameClaim.trim() || "preferred_username";
+  channel.displayNameClaim = channel.displayNameClaim.trim() || "name";
+  if (!channel.name) throw new Error("请填写登录渠道名称");
+  if (channel.type === "feishu") {
+    channel.issuer = "";
+    channel.clientId = "";
+    channel.clientSecret = "";
+    channel.scopes = [];
+    channel.subjectClaim = "open_id";
+    channel.usernameClaim = "name";
+    channel.displayNameClaim = "name";
+    return channel;
+  }
+  let issuer: URL;
+  try {
+    issuer = new URL(channel.issuer);
+  } catch {
+    throw new Error("OIDC Issuer 地址格式不正确");
+  }
+  if (
+    issuer.protocol !== "https:" &&
+    !(
+      issuer.protocol === "http:" &&
+      (issuer.hostname === "localhost" || issuer.hostname === "127.0.0.1" || issuer.hostname === "[::1]")
+    )
+  ) {
+    throw new Error("OIDC Issuer 必须使用 HTTPS；仅本机开发允许 HTTP");
+  }
+  if (!channel.clientId) throw new Error("请填写 OIDC Client ID");
+  if (!channel.clientSecret) throw new Error("请填写 OIDC Client Secret");
+  if (!channel.scopes.includes("openid")) channel.scopes.unshift("openid");
+  for (const claim of [channel.subjectClaim, channel.usernameClaim, channel.displayNameClaim]) {
+    if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(claim)) throw new Error("OIDC Claim 名称格式不正确");
+  }
+  return channel;
+}
+
 export class AppDb {
   private file: string;
   private data: DbShape = {
     users: [],
     domains: [],
     receiveChannels: [],
+    loginChannels: [],
+    authIdentities: [],
     sessions: [],
     auditLogs: [],
     mailAccounts: [],
@@ -398,6 +487,8 @@ export class AppDb {
         users: parsed.users || [],
         domains: parsed.domains || [],
         receiveChannels: parsed.receiveChannels || [],
+        loginChannels: parsed.loginChannels || [],
+        authIdentities: parsed.authIdentities || [],
         sessions: parsed.sessions || [],
         auditLogs: parsed.auditLogs || [],
         mailAccounts: parsed.mailAccounts || [],
@@ -411,7 +502,7 @@ export class AppDb {
           apiKeys: parsed.settings?.apiKeys || [],
         },
       };
-      let migrated = false;
+      let migrated = parsed.loginChannels === undefined || parsed.authIdentities === undefined;
       for (const u of this.data.users) {
         if (!u.role) u.role = "user";
         if (!u.status) u.status = "active";
@@ -445,6 +536,14 @@ export class AppDb {
         channel.pollIntervalSeconds = Math.min(3600, Math.max(30, channel.pollIntervalSeconds || 60));
         channel.lastSyncAt ||= null;
         channel.lastSyncError ||= "";
+        channel.updatedAt ||= channel.createdAt;
+        channel.updatedBy ||= "system";
+      }
+      for (const channel of this.data.loginChannels) {
+        channel.scopes ||= channel.type === "oidc" ? ["openid", "profile", "email"] : [];
+        channel.subjectClaim ||= channel.type === "oidc" ? "sub" : "open_id";
+        channel.usernameClaim ||= channel.type === "oidc" ? "preferred_username" : "name";
+        channel.displayNameClaim ||= "name";
         channel.updatedAt ||= channel.createdAt;
         channel.updatedBy ||= "system";
       }
@@ -690,6 +789,7 @@ export class AppDb {
     this.data.users = this.data.users.filter((u) => u.id !== userId);
     this.data.sessions = this.data.sessions.filter((s) => s.userId !== userId);
     this.data.domains = this.data.domains.filter((d) => d.userId !== userId);
+    this.data.authIdentities = this.data.authIdentities.filter((identity) => identity.userId !== userId);
     await this.queueWrite();
     return true;
   }
@@ -726,6 +826,205 @@ export class AppDb {
   async deleteSession(sessionId: string): Promise<void> {
     this.data.sessions = this.data.sessions.filter((s) => s.id !== sessionId);
     await this.queueWrite();
+  }
+
+  // ---- login channels / external identities ----
+
+  listLoginChannels(includeDisabled = false): LoginChannel[] {
+    return this.data.loginChannels
+      .filter((channel) => includeDisabled || channel.enabled)
+      .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+      .map((channel) => ({ ...channel, scopes: [...channel.scopes] }));
+  }
+
+  listLoginChannelsPublic(includeDisabled = false): PublicLoginChannel[] {
+    return this.listLoginChannels(includeDisabled).map(publicLoginChannel);
+  }
+
+  getLoginChannel(channelId: string | null | undefined): LoginChannel | undefined {
+    if (!channelId) return undefined;
+    return this.data.loginChannels.find((channel) => channel.id === channelId);
+  }
+
+  getLoginChannelIdentityCount(channelId: string): number {
+    return this.data.authIdentities.filter((identity) => identity.channelId === channelId).length;
+  }
+
+  async createLoginChannel(
+    input: {
+      name: string;
+      type: LoginChannelType;
+      enabled?: boolean;
+      issuer?: string;
+      clientId?: string;
+      clientSecret?: string;
+      scopes?: string[];
+      subjectClaim?: string;
+      usernameClaim?: string;
+      displayNameClaim?: string;
+    },
+    updatedBy: string,
+  ): Promise<LoginChannel> {
+    if (input.type !== "feishu" && input.type !== "oidc") {
+      throw new Error("不支持的登录渠道类型");
+    }
+    if (input.type === "feishu" && this.data.loginChannels.some((item) => item.type === "feishu")) {
+      throw new Error("飞书登录渠道已存在");
+    }
+    const now = new Date().toISOString();
+    const channel = normalizeLoginChannel({
+      id: id("lc_"),
+      name: String(input.name || ""),
+      type: input.type,
+      enabled: input.enabled ?? true,
+      issuer: String(input.issuer || ""),
+      clientId: String(input.clientId || ""),
+      clientSecret: String(input.clientSecret || ""),
+      scopes: Array.isArray(input.scopes) ? input.scopes.map(String) : [],
+      subjectClaim: String(input.subjectClaim || ""),
+      usernameClaim: String(input.usernameClaim || ""),
+      displayNameClaim: String(input.displayNameClaim || ""),
+      createdAt: now,
+      updatedAt: now,
+      updatedBy,
+    });
+    if (this.data.loginChannels.some((item) => item.name === channel.name)) {
+      throw new Error("登录渠道名称已存在");
+    }
+    this.data.loginChannels.push(channel);
+    await this.queueWrite();
+    return { ...channel, scopes: [...channel.scopes] };
+  }
+
+  async updateLoginChannel(
+    channelId: string,
+    patch: Partial<{
+      name: string;
+      enabled: boolean;
+      issuer: string;
+      clientId: string;
+      clientSecret: string;
+      scopes: string[];
+      subjectClaim: string;
+      usernameClaim: string;
+      displayNameClaim: string;
+    }>,
+    updatedBy: string,
+  ): Promise<LoginChannel | null> {
+    const current = this.getLoginChannel(channelId);
+    if (!current) return null;
+    if (this.getLoginChannelIdentityCount(channelId) > 0 && current.type === "oidc") {
+      const nextIssuer =
+        patch.issuer !== undefined ? String(patch.issuer).trim().replace(/\/$/, "") : current.issuer;
+      const nextClientId =
+        patch.clientId !== undefined ? String(patch.clientId).trim() : current.clientId;
+      const nextSubjectClaim =
+        patch.subjectClaim !== undefined
+          ? String(patch.subjectClaim).trim() || "sub"
+          : current.subjectClaim;
+      if (
+        nextIssuer !== current.issuer ||
+        nextClientId !== current.clientId ||
+        nextSubjectClaim !== current.subjectClaim
+      ) {
+        throw new Error("该登录渠道已有用户身份记录，不能修改 Issuer、Client ID 或用户唯一标识 Claim；请新建渠道");
+      }
+    }
+    const submittedSecret = patch.clientSecret !== undefined ? String(patch.clientSecret) : undefined;
+    const next = normalizeLoginChannel({
+      ...current,
+      name: patch.name !== undefined ? String(patch.name) : current.name,
+      enabled: patch.enabled ?? current.enabled,
+      issuer: patch.issuer !== undefined ? String(patch.issuer) : current.issuer,
+      clientId: patch.clientId !== undefined ? String(patch.clientId) : current.clientId,
+      clientSecret:
+        submittedSecret && !submittedSecret.includes("••") ? submittedSecret : current.clientSecret,
+      scopes: Array.isArray(patch.scopes) ? patch.scopes.map(String) : current.scopes,
+      subjectClaim:
+        patch.subjectClaim !== undefined ? String(patch.subjectClaim) : current.subjectClaim,
+      usernameClaim:
+        patch.usernameClaim !== undefined ? String(patch.usernameClaim) : current.usernameClaim,
+      displayNameClaim:
+        patch.displayNameClaim !== undefined
+          ? String(patch.displayNameClaim)
+          : current.displayNameClaim,
+      updatedAt: new Date().toISOString(),
+      updatedBy,
+    });
+    if (this.data.loginChannels.some((item) => item.id !== channelId && item.name === next.name)) {
+      throw new Error("登录渠道名称已存在");
+    }
+    Object.assign(current, next);
+    await this.queueWrite();
+    return { ...current, scopes: [...current.scopes] };
+  }
+
+  async deleteLoginChannel(channelId: string): Promise<boolean> {
+    if (this.data.authIdentities.some((identity) => identity.channelId === channelId)) {
+      throw new Error("该登录渠道已有用户身份记录，请停用而不是删除");
+    }
+    const before = this.data.loginChannels.length;
+    this.data.loginChannels = this.data.loginChannels.filter((channel) => channel.id !== channelId);
+    if (this.data.loginChannels.length === before) return false;
+    await this.queueWrite();
+    return true;
+  }
+
+  async resolveAuthIdentity(
+    channelId: string,
+    profile: { subject: string; username?: string; displayName?: string },
+  ): Promise<{ user: User; isNew: boolean }> {
+    const subject = profile.subject.trim().slice(0, 256);
+    if (!subject) throw new Error("登录渠道未返回用户唯一标识");
+    const now = new Date().toISOString();
+    const existing = this.data.authIdentities.find(
+      (identity) => identity.channelId === channelId && identity.subject === subject,
+    );
+    if (existing) {
+      const user = this.findUserById(existing.userId);
+      if (!user) throw new Error("外部身份绑定的用户不存在");
+      existing.lastLoginAt = now;
+      await this.queueWrite();
+      return { user, isNew: false };
+    }
+
+    let baseUsername = String(profile.username || "external")
+      .toLowerCase()
+      .split("@")[0]
+      .replace(/[^a-z0-9_]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 24);
+    if (baseUsername.length < 3) baseUsername = `user_${baseUsername || "oidc"}`.slice(0, 24);
+    let username = baseUsername;
+    while (this.findUserByUsername(username)) {
+      username = `${baseUsername.slice(0, 17)}_${randomBytes(3).toString("hex")}`;
+    }
+    let tenant = slugify(username) || id("t").slice(0, 10);
+    while (this.findUserByTenant(tenant)) {
+      tenant = `${tenant.slice(0, 25)}-${randomBytes(2).toString("hex")}`;
+    }
+    const user: User = {
+      id: id("u"),
+      username,
+      passwordHash: hashPassword(randomBytes(32).toString("base64url")),
+      tenant,
+      displayName: String(profile.displayName || username).trim().slice(0, 48) || username,
+      role: "user",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.data.users.push(user);
+    this.data.authIdentities.push({
+      id: id("ai_"),
+      channelId,
+      subject,
+      userId: user.id,
+      createdAt: now,
+      lastLoginAt: now,
+    });
+    await this.queueWrite();
+    return { user, isNew: true };
   }
 
   // ---- domains ----
